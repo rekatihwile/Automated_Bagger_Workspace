@@ -30,6 +30,12 @@ xlabel(ax3,'x [m]'); ylabel(ax3,'y [m]'); zlabel(ax3,'z [m]');
 ax2 = subplot(1,2,2); hold(ax2,'on'); grid(ax2,'on'); axis(ax2,'equal');
 title(ax2, 'Top View: Path + Workspace');
 xlabel(ax2,'x [m]'); ylabel(ax2,'y [m]');
+xlim(ax2, [-1.0 1.0]);
+ylim(ax2, [-0.2 1.2]);
+xticks(ax2, -1.0:0.5:1.0);
+yticks(ax2, -0.2:0.2:1.2);
+box(ax2, 'on');
+set(ax2, 'Layer', 'top');
 
 draw_scene(ax3, bagger, true);
 draw_scene(ax2, bagger, false);
@@ -82,8 +88,11 @@ q0 = qPath(1,:);
 axes(ax3);
 bagger.robot.plot(q0, 'scale', 0.3, 'noname');
 view(ax3, 38, 24);
-camlight('headlight');
-axis(ax3, [-0.9 1.1 -0.2 1.2 0 1.1]);
+lighting(ax3, 'gouraud');
+material(ax3, 'dull');
+
+% fixed light coming from above/front-right
+light(ax3, 'Position', [0.8 0.2 1.8], 'Style', 'local');
 
 % Telemetry
 txt1 = annotation(fig,'textbox',[0.37 0.89 0.25 0.04], ...
@@ -108,8 +117,9 @@ for i = 1:nPts
     axes(ax3);
     bagger.robot.plot(q, 'scale', 0.3, 'noname');
     view(ax3, 38, 24);
-    axis(ax3, [-0.9 1.1 -0.2 1.2 0 1.1]);
-
+xlim(ax3, [-0.9 1.1]);
+ylim(ax3, [-0.6 1.2]);
+zlim(ax3, [0 1.1]);    material(ax3, 'dull');
     T = bagger.fk(q);
     p = T.t;
 
@@ -184,8 +194,8 @@ if ~is3D
     zFloor = 0; zBelt = 0; zBag = 0;
 end
 
-draw_box(ax, bagger.dx, bagger.dy, bagger.wsW, bagger.wsD, zFloor, [0.90 0.90 0.90], 0.22);
-draw_box(ax, bagger.dx+0.1, bagger.dy+0.1, 0.5, 0.5, zBelt, [0.12 0.12 0.12], 1.0);
+draw_box(ax, bagger.dx, bagger.dy, bagger.wsW, bagger.wsD, zFloor, [0.90 0.90 0.90], 1.0);
+draw_box(ax, bagger.dx+0.1, bagger.dy+0.1, 0.5, 0.5, zBelt,[0.20 0.20 0.20], 1.0);
 draw_box(ax, bagger.dx+0.75, bagger.dy+0.2, 0.2, 0.3, zBag, [0.55 0.35 0.15], 1.0);
 
 if ~is3D
@@ -205,8 +215,15 @@ function h = draw_box(ax, x, y, w, l, hgt, color, alphaVal)
 v = [0 0 0; w 0 0; w l 0; 0 l 0; 0 0 hgt; w 0 hgt; w l hgt; 0 l hgt];
 f = [1 2 3 4; 5 6 7 8; 1 2 6 5; 2 3 7 6; 3 4 8 7; 4 1 5 8];
 t = hgtransform('Parent', ax);
-patch('Vertices',v,'Faces',f,'FaceColor',color,'FaceAlpha',alphaVal, ...
-    'EdgeColor','k','LineWidth',1,'Parent',t);
+p = patch('Vertices',v,'Faces',f,'FaceColor',color,'FaceAlpha',alphaVal, ...
+    'EdgeColor','k','LineWidth',1,'Parent',t, ...
+    'FaceLighting','gouraud', ...
+    'EdgeLighting','none', ...
+    'BackFaceLighting','reverselit');
+set(p, 'AmbientStrength', 0.35, ...
+       'DiffuseStrength', 0.85, ...
+       'SpecularStrength', 0.12, ...
+       'SpecularExponent', 20);
 set(t, 'Matrix', makehgtform('translate', x, y, 0));
 h = t;
 end
