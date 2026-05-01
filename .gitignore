@@ -1,23 +1,40 @@
-*.json
+# Local environment
+.venv/
+
+# Generated/data-heavy project folders. Keep the folder README files trackable.
+calibration/*
+!calibration/README.md
+external/*
+!external/README.md
+
+# Model checkpoints and weights
+*.pth
+*.pt
+
+# Point clouds and numpy outputs
+*.ply
+*.npy
+
+# Video outputs
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# Python caches
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# CAD and archives
 *.stl
 *.step
 *.STL
-*.mp4
-*.mov
-*.avi
-*.mkv
-*.webm
-*.pt
-*.ply
-*.pth
-*.png
-*.jpg
-*.jpeg
-*.bmp
-*.gif
+*.SLDPRT
+*.SLDASM
 *.zip
 *.tar
 *.gz
 *.7z
-*.pyc
-__pycache__/

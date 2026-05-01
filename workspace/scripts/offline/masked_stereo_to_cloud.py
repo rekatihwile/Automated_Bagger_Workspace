@@ -71,6 +71,32 @@ import config
 DEFAULT_PAIRS_DIR = config.CALIBRATION_ROOT / "sam_indexed_pairs"
 DEFAULT_OUT_ROOT  = config.CALIBRATION_ROOT / "masked_stereo_cloud_outputs"
 
+# ================= USER SETTINGS =================
+PAIR_INDEX = 1
+USE_LATEST = False
+STEREO_BACKEND = "raft"  # "sgbm" or "raft"
+
+SGBM_NUM_DISPARITIES = 128
+SGBM_BLOCK_SIZE = 7
+MIN_DISP = 1.0
+
+RAFT_REPO_DIR = "external/RAFT-Stereo"
+RAFT_CHECKPOINT = "workspace/models/raft_stereo/raftstereo-middlebury.pth"
+RAFT_ITERS = 32
+RAFT_CORR_IMPLEMENTATION = "alt"
+RAFT_MIXED_PRECISION = True
+
+VALIDATION_MODE = "dilated"  # "strict", "dilated", or "left-only"
+LEFT_MASK_DILATE = 3
+RIGHT_MASK_DILATE = 7
+
+OUTLIER_MODE = "xyz"  # "z-only", "xyz", or "none"
+CLIP_LOW = 1.0
+CLIP_HIGH = 99.0
+MAX_POINTS = 100_000
+SCALE_TO_METERS = 0.001
+# =================================================
+
 
 # ---------------------------------------------------------------------------
 # SGBM
@@ -369,38 +395,62 @@ def main() -> None:
     )
 
     # -- pair selection --
-    parser.add_argument("--index",     type=int,  default=None,
+    parser.add_argument("--index",     type=int,  default=PAIR_INDEX,
                         help="Pair index to process.")
-    parser.add_argument("--latest",    action="store_true",
+    parser.add_argument("--latest",    action=argparse.BooleanOptionalAction,
+                        default=USE_LATEST,
                         help="Use the highest-numbered indexed pair.")
     parser.add_argument("--pairs-dir", type=Path, default=DEFAULT_PAIRS_DIR,
                         help=f"Root of indexed pairs (default: {DEFAULT_PAIRS_DIR}).")
     parser.add_argument("--out-root",  type=Path, default=DEFAULT_OUT_ROOT,
-                        help=f"Root for outputs (default: {DEFAULT_OUT_ROOT}).")
+                        help=(
+                            f"Root for outputs (default: {DEFAULT_OUT_ROOT}). "
+                            "Backend and pair subfolders are added automatically."
+                        ))
+
+    # -- stereo backend --
+    parser.add_argument("--stereo-backend", choices=["sgbm", "raft"],
+                        default=STEREO_BACKEND,
+                        help=f"Stereo disparity backend (default: {STEREO_BACKEND}).")
 
     # -- SGBM --
-    parser.add_argument("--num-disparities", type=int,   default=128,
+    parser.add_argument("--num-disparities", type=int,   default=SGBM_NUM_DISPARITIES,
                         help="SGBM numDisparities, multiple of 16 (default: 128).")
-    parser.add_argument("--block-size",      type=int,   default=7,
+    parser.add_argument("--block-size",      type=int,   default=SGBM_BLOCK_SIZE,
                         help="SGBM blockSize, odd number (default: 7).")
-    parser.add_argument("--min-disp",        type=float, default=1.0,
+    parser.add_argument("--min-disp",        type=float, default=MIN_DISP,
                         help="Minimum valid disparity value (default: 1.0).")
 
+    # -- RAFT-Stereo --
+    parser.add_argument("--raft-repo-dir", type=Path, default=Path(RAFT_REPO_DIR),
+                        help=f"Path to RAFT-Stereo repo (default: {RAFT_REPO_DIR}).")
+    parser.add_argument("--raft-checkpoint", type=Path, default=Path(RAFT_CHECKPOINT),
+                        help=f"Path to RAFT-Stereo checkpoint (default: {RAFT_CHECKPOINT}).")
+    parser.add_argument("--raft-iters", type=int, default=RAFT_ITERS,
+                        help=f"RAFT update iterations (default: {RAFT_ITERS}).")
+    parser.add_argument("--raft-corr-implementation",
+                        choices=["reg", "alt", "reg_cuda", "alt_cuda"],
+                        default=RAFT_CORR_IMPLEMENTATION,
+                        help=f"RAFT correlation implementation (default: {RAFT_CORR_IMPLEMENTATION}).")
+    parser.add_argument("--raft-mixed-precision", action=argparse.BooleanOptionalAction,
+                        default=RAFT_MIXED_PRECISION,
+                        help=f"Use RAFT mixed precision when CUDA is available (default: {RAFT_MIXED_PRECISION}).")
+
     # -- mask dilation --
-    parser.add_argument("--left-mask-dilate",  type=int, default=3,
+    parser.add_argument("--left-mask-dilate",  type=int, default=LEFT_MASK_DILATE,
                         help="Dilate left mask by this radius before dilated-mode validation "
-                             "(default: 3).")
-    parser.add_argument("--right-mask-dilate", type=int, default=7,
+                             f"(default: {LEFT_MASK_DILATE}).")
+    parser.add_argument("--right-mask-dilate", type=int, default=RIGHT_MASK_DILATE,
                         help="Dilate right mask by this radius before dilated-mode validation "
-                             "(default: 7).")
+                             f"(default: {RIGHT_MASK_DILATE}).")
 
     # -- validation mode --
     parser.add_argument(
         "--validation-mode",
         choices=["strict", "dilated", "left-only"],
-        default="dilated",
+        default=VALIDATION_MODE,
         help=(
-            "Point acceptance strategy (default: dilated).\n"
+            f"Point acceptance strategy (default: {VALIDATION_MODE}).\n"
             "  strict    — original SAM masks, exact shifted right-mask check.\n"
             "  dilated   — dilated masks, tolerates SAM boundary mismatch.\n"
             "  left-only — ignore right mask; keep all left-mask pixels with valid disparity."
@@ -411,26 +461,32 @@ def main() -> None:
     parser.add_argument(
         "--outlier-mode",
         choices=["z-only", "xyz", "none"],
-        default="xyz",
+        default=OUTLIER_MODE,
         help=(
-            "Percentile outlier removal after reprojection (default: xyz).\n"
+            f"Percentile outlier removal after reprojection (default: {OUTLIER_MODE}).\n"
             "  z-only — clip on Z axis only.\n"
             "  xyz    — clip independently on X, Y, and Z.\n"
             "  none   — no outlier removal (only finite-value filter)."
         ),
     )
-    parser.add_argument("--clip-low",  type=float, default=1.0,
-                        help="Lower percentile for outlier clipping (default: 1.0).")
-    parser.add_argument("--clip-high", type=float, default=99.0,
-                        help="Upper percentile for outlier clipping (default: 99.0).")
+    parser.add_argument("--clip-low",  type=float, default=CLIP_LOW,
+                        help=f"Lower percentile for outlier clipping (default: {CLIP_LOW}).")
+    parser.add_argument("--clip-high", type=float, default=CLIP_HIGH,
+                        help=f"Upper percentile for outlier clipping (default: {CLIP_HIGH}).")
 
     # -- misc --
-    parser.add_argument("--max-points",      type=int,   default=100_000,
-                        help="Downsample to at most this many points (default: 100000).")
-    parser.add_argument("--scale-to-meters", type=float, default=0.001,
-                        help="Multiply XYZ by this before saving (default: 0.001 → mm→m).")
+    parser.add_argument("--max-points",      type=int,   default=MAX_POINTS,
+                        help=f"Downsample to at most this many points (default: {MAX_POINTS}).")
+    parser.add_argument("--scale-to-meters", type=float, default=SCALE_TO_METERS,
+                        help=f"Multiply XYZ by this before saving (default: {SCALE_TO_METERS} → mm→m).")
 
     args = parser.parse_args()
+    cli_args = sys.argv[1:]
+
+    # If USER SETTINGS have USE_LATEST=True, an explicit CLI --index should still
+    # select that index unless the CLI also explicitly asks for latest.
+    if "--index" in cli_args and "--latest" not in cli_args and "--no-latest" not in cli_args:
+        args.latest = False
 
     if args.index is None and not args.latest:
         parser.error("Provide --index N or --latest.")
@@ -443,6 +499,7 @@ def main() -> None:
 
     print(f"[INFO] Pair index      : {idx:06d}")
     print(f"[INFO] Pair dir        : {pair_dir}")
+    print(f"[INFO] Stereo backend  : {args.stereo_backend}")
     print(f"[INFO] Validation mode : {args.validation_mode}")
     print(f"[INFO] Outlier mode    : {args.outlier_mode}  "
           f"[{args.clip_low}–{args.clip_high} pct]")
@@ -472,8 +529,14 @@ def main() -> None:
 
     h, w = left_bgr.shape[:2]
     print(f"[INFO] Image size      : {w}×{h}")
-    print(f"[INFO] SGBM params     : numDisparities={args.num_disparities}"
-          f"  blockSize={args.block_size}  minDisp={args.min_disp}")
+    if args.stereo_backend == "sgbm":
+        print(f"[INFO] SGBM params     : numDisparities={args.num_disparities}"
+              f"  blockSize={args.block_size}  minDisp={args.min_disp}")
+    else:
+        print(f"[INFO] RAFT params     : iters={args.raft_iters}"
+              f"  corr={args.raft_corr_implementation}"
+              f"  mixedPrecision={args.raft_mixed_precision}"
+              f"  minDisp={args.min_disp}")
     print()
 
     if left_bgr.shape[:2] != right_bgr.shape[:2]:
@@ -526,11 +589,25 @@ def main() -> None:
     Q = calib["disparity_to_depth_Q"]
 
     # ------------------------------------------------------------------
-    # Compute SGBM disparity on FULL unmasked images
+    # Compute disparity on FULL unmasked images
     # ------------------------------------------------------------------
-    print("[INFO] Computing SGBM disparity on full rectified images …")
-    matcher = _make_sgbm(args.num_disparities, args.block_size)
-    disp    = _compute_disparity(left_bgr, right_bgr, matcher)
+    if args.stereo_backend == "sgbm":
+        print("[INFO] Computing SGBM disparity on full rectified images …")
+        matcher = _make_sgbm(args.num_disparities, args.block_size)
+        disp    = _compute_disparity(left_bgr, right_bgr, matcher)
+    else:
+        print("[INFO] Computing RAFT-Stereo disparity on full rectified images …")
+        from stereo_raft import compute_raft_disparity
+
+        disp = compute_raft_disparity(
+            left_bgr,
+            right_bgr,
+            raft_repo_dir=args.raft_repo_dir,
+            checkpoint=args.raft_checkpoint,
+            iters=args.raft_iters,
+            corr_implementation=args.raft_corr_implementation,
+            mixed_precision=args.raft_mixed_precision,
+        )
 
     n_disp_valid = int(np.count_nonzero(disp > args.min_disp))
     print(f"[DISP] Pixels with disparity > {args.min_disp}: {n_disp_valid}")
@@ -654,7 +731,8 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Save outputs
     # ------------------------------------------------------------------
-    out_dir = args.out_root / f"pair_{idx:06d}"
+    backend_out_dir = args.stereo_backend.upper()
+    out_dir = args.out_root / backend_out_dir / f"pair_{idx:06d}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     xyz_m = xyz * args.scale_to_meters
@@ -716,10 +794,9 @@ def main() -> None:
         f"Input dir         : {pair_dir}",
         f"Output dir        : {out_dir}",
         f"Image size        : {w}×{h}",
+        f"Stereo backend    : {args.stereo_backend}",
         f"Validation mode   : {args.validation_mode}",
         f"Outlier mode      : {args.outlier_mode}  [{args.clip_low}–{args.clip_high} pct]",
-        f"SGBM params       : numDisparities={args.num_disparities}"
-            f"  blockSize={args.block_size}  minDisp={args.min_disp}",
         f"Left mask dilate  : r={args.left_mask_dilate}",
         f"Right mask dilate : r={args.right_mask_dilate}",
         f"",
@@ -735,6 +812,20 @@ def main() -> None:
         f"",
         f"Final point count : {n_final}",
     ]
+    if args.stereo_backend == "sgbm":
+        lines.insert(
+            7,
+            f"SGBM params       : numDisparities={args.num_disparities}"
+            f"  blockSize={args.block_size}  minDisp={args.min_disp}",
+        )
+    else:
+        lines.insert(
+            7,
+            f"RAFT params       : iters={args.raft_iters}"
+            f"  corr={args.raft_corr_implementation}"
+            f"  mixedPrecision={args.raft_mixed_precision}"
+            f"  minDisp={args.min_disp}",
+        )
     if n_final > 0:
         med  = np.median(xyz_m, axis=0)
         p05  = np.percentile(xyz_m,  5, axis=0)

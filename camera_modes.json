@@ -1,0 +1,12 @@
+{
+  "generated_at": "2026-04-20T12:18:57",
+  "backend": "DSHOW",
+  "fourcc": "MJPG",
+  "fps": 30,
+  "native": {
+    "width": 3840,
+    "height": 1080,
+    "pixels": 4147200
+  },
+  "indices": {}
+}

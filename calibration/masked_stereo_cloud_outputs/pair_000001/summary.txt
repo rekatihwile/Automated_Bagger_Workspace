@@ -1,8 +1,9 @@
 Pair index        : 1
 Input dir         : C:\Users\elipp\OneDrive\Documents\Grocery Bagger\calibration\sam_indexed_pairs\pair_000001
-Output dir        : C:\Users\elipp\OneDrive\Documents\Grocery Bagger\calibration\masked_stereo_cloud_outputs\pair_000001
+Output dir        : C:\Users\elipp\OneDrive\Documents\Grocery Bagger\calibration\masked_stereo_cloud_outputs\SGBM\pair_000001
 Image size        : 640×480
-Validation mode   : left-only
+Stereo backend    : sgbm
+Validation mode   : dilated
 Outlier mode      : xyz  [1.0–99.0 pct]
 SGBM params       : numDisparities=128  blockSize=7  minDisp=1.0
 Left mask dilate  : r=3
@@ -16,13 +17,13 @@ Validation candidates:
   left-only              : 7234 px
   strict (orig masks)    : 6621 px
   dilated                : 7575 px
-  CHOSEN (left-only) : 7234 px
+  CHOSEN (dilated) : 7575 px
 
-Final point count : 6918
+Final point count : 7186
 
-Median XYZ (m)    : 0.0239  -0.0343  0.3085
-5th pct XYZ (m)   : 0.0054  -0.0743  0.2779
-95th pct XYZ (m)  : 0.0593  0.0239  0.3546
-Dimensions (m)    : 0.0539  0.0981  0.0768
+Median XYZ (m)    : 0.0218  -0.0346  0.3075
+5th pct XYZ (m)   : 0.0039  -0.0731  0.2776
+95th pct XYZ (m)  : 0.0582  0.0235  0.3475
+Dimensions (m)    : 0.0543  0.0966  0.0699
 
-PLY : C:\Users\elipp\OneDrive\Documents\Grocery Bagger\calibration\masked_stereo_cloud_outputs\pair_000001\object_cloud.ply
+PLY : C:\Users\elipp\OneDrive\Documents\Grocery Bagger\calibration\masked_stereo_cloud_outputs\SGBM\pair_000001\object_cloud.ply

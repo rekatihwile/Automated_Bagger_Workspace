@@ -76,7 +76,8 @@ except ImportError as exc:
     ) from exc
 
 
-DEFAULT_CHECKPOINT = WORKSPACE_ROOT / "models" / "sam_vit_b_01ec64.pth"
+DEFAULT_CHECKPOINT = WORKSPACE_ROOT / "models" / "sam" / "sam_vit_b_01ec64.pth"
+LEGACY_CHECKPOINT = WORKSPACE_ROOT / "models" / "sam_vit_b_01ec64.pth"
 DEFAULT_OUT_DIR = config.CALIBRATION_ROOT / "sam_live_snapshot_tests"
 
 WINDOW_LIVE = "SAM Live Stereo Preview — SPACE=snapshot  q=quit"
@@ -763,6 +764,9 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    if not args.checkpoint.exists() and args.checkpoint == DEFAULT_CHECKPOINT and LEGACY_CHECKPOINT.exists():
+        args.checkpoint = LEGACY_CHECKPOINT
 
     if not args.checkpoint.exists():
         raise FileNotFoundError(
