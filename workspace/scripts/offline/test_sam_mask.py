@@ -1,29 +1,30 @@
 """
-Test Segment Anything on a saved image or saved stereo pair.
+Live HBVCam snapshot + SAM mask tester.
 
-Purpose:
-  First SAM sanity check before doing stereo point clouds.
-
-Modes:
-  1. Single image:
-      python workspace/scripts/offline/test_sam_mask.py --image path/to/image.png --checkpoint workspace/models/sam_vit_b.pth
-
-  2. Stereo pair from your saved capture folders:
-      python workspace/scripts/offline/test_sam_mask.py --index 40 --checkpoint workspace/models/sam_vit_b.pth --rectify
+What this does:
+1. Opens your stereo camera.
+2. Captures one live stereo frame.
+3. Splits left/right.
+4. Optionally rectifies the left image.
+5. Lets you click or box-prompt the object.
+6. Runs SAM.
+7. Saves the input image, mask, and overlay.
 
 Controls:
-  Left click       = positive SAM point
-  Right click      = negative SAM point
-  b                = draw box prompt
-  p                = predict mask
-  n                = cycle mask candidate
-  s                = save current mask + overlay
-  c                = clear prompts
-  q / Esc          = quit
+  SPACE  = take new snapshot from camera
+  b      = draw box around object
+  left click  = positive SAM point
+  right click = negative SAM point
+  p      = predict SAM mask
+  n      = cycle mask candidate
+  t      = type a text label/note for saved filename/overlay
+  s      = save current mask/overlay
+  c      = clear prompts
+  q/Esc  = quit
 
-Recommended first use:
-  Draw a box around the object with 'b', then press 'p'.
-  Box prompts are usually much better than single-click prompts.
+Important:
+  Regular SAM does NOT understand text prompts like "pill bottle".
+  The text label here is only a saved note, not a segmentation prompt.
 """
 
 from __future__ import annotations
@@ -43,17 +44,13 @@ import torch
 # ---------------------------------------------------------------------
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
-PROJECT_ROOT = WORKSPACE_ROOT.parent
 
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
 import config
+from camera import StereoCamera
 
-
-# ---------------------------------------------------------------------
-# SAM import
-# ---------------------------------------------------------------------
 
 try:
     from segment_anything import sam_model_registry, SamPredictor
@@ -65,33 +62,7 @@ except ImportError as exc:
     ) from exc
 
 
-WINDOW = "SAM mask test"
-
-
-# ---------------------------------------------------------------------
-# Image loading / rectification
-# ---------------------------------------------------------------------
-
-def list_pairs(left_dir: Path, right_dir: Path) -> list[tuple[Path, Path]]:
-    exts = ("*.png", "*.jpg", "*.jpeg", "*.bmp")
-
-    lefts = []
-    rights = []
-
-    for ext in exts:
-        lefts.extend(sorted(left_dir.glob(ext)))
-        rights.extend(sorted(right_dir.glob(ext)))
-
-    lefts = sorted(lefts)
-    rights = sorted(rights)
-
-    if not lefts:
-        raise FileNotFoundError(f"No left images found in: {left_dir}")
-    if not rights:
-        raise FileNotFoundError(f"No right images found in: {right_dir}")
-
-    n = min(len(lefts), len(rights))
-    return list(zip(lefts[:n], rights[:n]))
+WINDOW = "Live SAM Snapshot"
 
 
 def load_calibration() -> dict[str, np.ndarray]:
@@ -122,7 +93,6 @@ def load_calibration() -> dict[str, np.ndarray]:
 
 def rectify_left_image(left_bgr: np.ndarray) -> np.ndarray:
     calib = load_calibration()
-
     h, w = left_bgr.shape[:2]
 
     map_lx, map_ly = cv2.initUndistortRectifyMap(
@@ -134,49 +104,13 @@ def rectify_left_image(left_bgr: np.ndarray) -> np.ndarray:
         cv2.CV_32FC1,
     )
 
-    left_rect = cv2.remap(left_bgr, map_lx, map_ly, cv2.INTER_LINEAR)
-    return left_rect
+    return cv2.remap(left_bgr, map_lx, map_ly, cv2.INTER_LINEAR)
 
 
-def load_input_image(args: argparse.Namespace) -> tuple[np.ndarray, str]:
-    if args.image is not None:
-        img = cv2.imread(str(args.image), cv2.IMREAD_COLOR)
-        if img is None:
-            raise FileNotFoundError(f"Could not read image: {args.image}")
-
-        label = str(args.image)
-        return img, label
-
-    pairs = list_pairs(args.left_dir, args.right_dir)
-
-    if args.index < 0 or args.index >= len(pairs):
-        raise IndexError(f"--index {args.index} outside range 0..{len(pairs) - 1}")
-
-    left_path, right_path = pairs[args.index]
-    img = cv2.imread(str(left_path), cv2.IMREAD_COLOR)
-
-    if img is None:
-        raise FileNotFoundError(f"Could not read left image: {left_path}")
-
-    label = f"pair index {args.index}: {left_path.name}"
-
-    if args.rectify:
-        print("[INFO] Rectifying left image before SAM...")
-        img = rectify_left_image(img)
-        label += " [rectified]"
-
-    return img, label
-
-
-# ---------------------------------------------------------------------
-# Visualization
-# ---------------------------------------------------------------------
-
-def colorize_mask(mask: np.ndarray, color_bgr: tuple[int, int, int] = (0, 255, 0)) -> np.ndarray:
-    mask_u8 = (mask > 0).astype(np.uint8)
-    color = np.zeros((*mask_u8.shape, 3), dtype=np.uint8)
-    color[mask_u8 > 0] = color_bgr
-    return color
+def colorize_mask(mask: np.ndarray, color_bgr=(0, 255, 0)) -> np.ndarray:
+    out = np.zeros((*mask.shape, 3), dtype=np.uint8)
+    out[mask > 0] = color_bgr
+    return out
 
 
 def make_overlay(
@@ -185,38 +119,46 @@ def make_overlay(
     pos_points: list[tuple[int, int]],
     neg_points: list[tuple[int, int]],
     box: tuple[int, int, int, int] | None,
-    text_lines: list[str],
+    label: str,
+    status: str,
 ) -> np.ndarray:
     out = image_bgr.copy()
 
     if mask is not None:
-        mask_color = colorize_mask(mask, (0, 255, 0))
+        mask_u8 = (mask > 0).astype(np.uint8)
+        mask_color = colorize_mask(mask_u8)
         out = cv2.addWeighted(out, 0.72, mask_color, 0.28, 0)
 
         contours, _ = cv2.findContours(
-            (mask > 0).astype(np.uint8),
+            mask_u8,
             cv2.RETR_EXTERNAL,
             cv2.CHAIN_APPROX_SIMPLE,
         )
         cv2.drawContours(out, contours, -1, (0, 255, 0), 2)
 
     for x, y in pos_points:
-        cv2.circle(out, (x, y), 5, (0, 255, 0), -1)
-        cv2.circle(out, (x, y), 8, (0, 0, 0), 1)
+        cv2.circle(out, (x, y), 6, (0, 255, 0), -1)
+        cv2.circle(out, (x, y), 9, (0, 0, 0), 1)
 
     for x, y in neg_points:
-        cv2.circle(out, (x, y), 5, (0, 0, 255), -1)
-        cv2.circle(out, (x, y), 8, (0, 0, 0), 1)
+        cv2.circle(out, (x, y), 6, (0, 0, 255), -1)
+        cv2.circle(out, (x, y), 9, (0, 0, 0), 1)
 
     if box is not None:
         x1, y1, x2, y2 = box
         cv2.rectangle(out, (x1, y1), (x2, y2), (255, 180, 0), 2)
 
-    y = 26
-    for line in text_lines:
+    lines = [
+        status,
+        f"label/note: {label if label else '(none)'}",
+        "SPACE=snapshot | b=box | left+=object | right+=background | p=predict | n=next | t=label | s=save | c=clear | q=quit",
+    ]
+
+    y = 28
+    for line in lines:
         cv2.putText(out, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 0), 4, cv2.LINE_AA)
         cv2.putText(out, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
-        y += 25
+        y += 26
 
     return out
 
@@ -226,43 +168,46 @@ def save_outputs(
     image_bgr: np.ndarray,
     overlay_bgr: np.ndarray,
     mask: np.ndarray | None,
+    label: str,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
+
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_label = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in label.strip())
+    if safe_label:
+        stem = f"{stamp}_{safe_label}"
+    else:
+        stem = stamp
 
-    image_path = out_dir / f"{stamp}_sam_input.png"
-    overlay_path = out_dir / f"{stamp}_sam_overlay.png"
-    mask_path = out_dir / f"{stamp}_sam_mask.png"
+    input_path = out_dir / f"{stem}_input.png"
+    overlay_path = out_dir / f"{stem}_overlay.png"
+    mask_path = out_dir / f"{stem}_mask.png"
 
-    cv2.imwrite(str(image_path), image_bgr)
+    cv2.imwrite(str(input_path), image_bgr)
     cv2.imwrite(str(overlay_path), overlay_bgr)
 
     if mask is not None:
         cv2.imwrite(str(mask_path), (mask > 0).astype(np.uint8) * 255)
 
-    print(f"[SAVE] Input:   {image_path}")
+    print(f"[SAVE] Input:   {input_path}")
     print(f"[SAVE] Overlay: {overlay_path}")
     if mask is not None:
         print(f"[SAVE] Mask:    {mask_path}")
 
 
-# ---------------------------------------------------------------------
-# Main interactive SAM tool
-# ---------------------------------------------------------------------
-
-class SamMaskTester:
+class LiveSamSnapshotTool:
     def __init__(
         self,
-        image_bgr: np.ndarray,
         predictor: SamPredictor,
+        rectify: bool,
         out_dir: Path,
-        label: str,
     ) -> None:
-        self.image_bgr = image_bgr
-        self.image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         self.predictor = predictor
+        self.rectify = rectify
         self.out_dir = out_dir
-        self.label = label
+
+        self.image_bgr: np.ndarray | None = None
+        self.image_rgb: np.ndarray | None = None
 
         self.pos_points: list[tuple[int, int]] = []
         self.neg_points: list[tuple[int, int]] = []
@@ -272,24 +217,14 @@ class SamMaskTester:
         self.scores: np.ndarray | None = None
         self.current_mask_idx = 0
 
-        print("[INFO] Setting SAM image embedding. This may take a few seconds...")
-        self.predictor.set_image(self.image_rgb)
-        print("[INFO] SAM is ready.")
+        self.label = ""
+        self.status = "Press SPACE to take a snapshot."
 
     @property
     def current_mask(self) -> np.ndarray | None:
         if self.masks is None:
             return None
         return self.masks[self.current_mask_idx]
-
-    def mouse_callback(self, event, x, y, flags, param) -> None:
-        if event == cv2.EVENT_LBUTTONDOWN:
-            self.pos_points.append((x, y))
-            print(f"[PROMPT] Positive point: ({x}, {y})")
-
-        elif event == cv2.EVENT_RBUTTONDOWN:
-            self.neg_points.append((x, y))
-            print(f"[PROMPT] Negative point: ({x}, {y})")
 
     def clear_prompts(self) -> None:
         self.pos_points.clear()
@@ -298,29 +233,81 @@ class SamMaskTester:
         self.masks = None
         self.scores = None
         self.current_mask_idx = 0
-        print("[INFO] Cleared prompts and masks.")
+        self.status = "Cleared prompts."
+
+    def set_image(self, left_bgr: np.ndarray) -> None:
+        if self.rectify:
+            print("[INFO] Rectifying left image...")
+            left_bgr = rectify_left_image(left_bgr)
+
+        self.image_bgr = left_bgr
+        self.image_rgb = cv2.cvtColor(left_bgr, cv2.COLOR_BGR2RGB)
+
+        self.clear_prompts()
+        self.status = "Setting SAM image embedding..."
+        print("[INFO] Setting SAM image embedding. This may take a few seconds.")
+        self.predictor.set_image(self.image_rgb)
+        self.status = "Snapshot ready. Draw box or click points, then press p."
+        print("[INFO] Snapshot ready.")
+
+    def take_snapshot(self, cam: StereoCamera) -> None:
+        ok, left, right = cam.read_pair()
+        if not ok or left is None:
+            self.status = "Failed to read camera frame."
+            print("[WARN] Failed to read camera frame.")
+            return
+
+        self.set_image(left)
+
+    def mouse_callback(self, event, x, y, flags, param) -> None:
+        if self.image_bgr is None:
+            return
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self.pos_points.append((x, y))
+            self.status = f"Added positive point ({x}, {y})."
+            print(f"[PROMPT] Positive point: ({x}, {y})")
+
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            self.neg_points.append((x, y))
+            self.status = f"Added negative point ({x}, {y})."
+            print(f"[PROMPT] Negative point: ({x}, {y})")
 
     def select_box(self) -> None:
-        temp = self.image_bgr.copy()
-        roi = cv2.selectROI("Draw SAM box prompt", temp, showCrosshair=True, fromCenter=False)
+        if self.image_bgr is None:
+            self.status = "Take a snapshot first."
+            return
+
+        roi = cv2.selectROI(
+            "Draw SAM box prompt",
+            self.image_bgr,
+            showCrosshair=True,
+            fromCenter=False,
+        )
         cv2.destroyWindow("Draw SAM box prompt")
 
         x, y, w, h = roi
         if w <= 0 or h <= 0:
-            print("[INFO] Box selection canceled.")
+            self.status = "Box selection canceled."
             return
 
         self.box = (int(x), int(y), int(x + w), int(y + h))
+        self.status = f"Box selected: {self.box}. Press p to predict."
         print(f"[PROMPT] Box: {self.box}")
 
     def predict(self) -> None:
+        if self.image_bgr is None:
+            self.status = "Take a snapshot first."
+            return
+
         point_coords = None
         point_labels = None
         box_np = None
 
-        points = self.pos_points + self.neg_points
-        if points:
-            point_coords = np.array(points, dtype=np.float32)
+        all_points = self.pos_points + self.neg_points
+
+        if all_points:
+            point_coords = np.array(all_points, dtype=np.float32)
             point_labels = np.array(
                 [1] * len(self.pos_points) + [0] * len(self.neg_points),
                 dtype=np.int32,
@@ -330,7 +317,8 @@ class SamMaskTester:
             box_np = np.array(self.box, dtype=np.float32)
 
         if point_coords is None and box_np is None:
-            print("[WARN] Add a point or draw a box first.")
+            self.status = "Add a click or draw a box first."
+            print("[WARN] Add a click or draw a box first.")
             return
 
         masks, scores, logits = self.predictor.predict(
@@ -344,32 +332,40 @@ class SamMaskTester:
         self.scores = scores
         self.current_mask_idx = int(np.argmax(scores))
 
+        self.status = f"Predicted mask {self.current_mask_idx}, score={scores[self.current_mask_idx]:.3f}"
         print("[OK] Predicted masks:")
-        for i, s in enumerate(scores):
-            print(f"     mask {i}: score={s:.4f}")
+        for i, score in enumerate(scores):
+            print(f"     mask {i}: score={score:.4f}")
         print(f"     selected mask {self.current_mask_idx}")
 
     def cycle_mask(self) -> None:
         if self.masks is None:
-            print("[WARN] No masks yet. Press 'p' first.")
+            self.status = "No masks yet. Press p first."
             return
 
         self.current_mask_idx = (self.current_mask_idx + 1) % len(self.masks)
         score = self.scores[self.current_mask_idx] if self.scores is not None else float("nan")
-        print(f"[INFO] Current mask: {self.current_mask_idx}, score={score:.4f}")
+        self.status = f"Current mask {self.current_mask_idx}, score={score:.3f}"
+        print(f"[INFO] Current mask {self.current_mask_idx}, score={score:.4f}")
+
+    def enter_label(self) -> None:
+        label = input("Enter label/note for this object, e.g. pill_bottle: ").strip()
+        self.label = label
+        self.status = f"Label set to: {label}"
+        print(f"[INFO] Label set to: {label}")
 
     def draw(self) -> np.ndarray:
-        if self.masks is not None and self.scores is not None:
-            score = self.scores[self.current_mask_idx]
-            mask_text = f"mask {self.current_mask_idx}/{len(self.masks)-1}, score={score:.3f}"
-        else:
-            mask_text = "no mask yet"
-
-        lines = [
-            self.label,
-            mask_text,
-            "left click=positive | right click=negative | b=box | p=predict | n=next | s=save | c=clear | q=quit",
-        ]
+        if self.image_bgr is None:
+            blank = np.zeros((480, 640, 3), dtype=np.uint8)
+            return make_overlay(
+                blank,
+                None,
+                [],
+                [],
+                None,
+                self.label,
+                self.status,
+            )
 
         return make_overlay(
             self.image_bgr,
@@ -377,37 +373,75 @@ class SamMaskTester:
             self.pos_points,
             self.neg_points,
             self.box,
-            lines,
+            self.label,
+            self.status,
         )
+
+    def save(self) -> None:
+        if self.image_bgr is None:
+            self.status = "Nothing to save. Take a snapshot first."
+            return
+
+        overlay = self.draw()
+        save_outputs(
+            out_dir=self.out_dir,
+            image_bgr=self.image_bgr,
+            overlay_bgr=overlay,
+            mask=self.current_mask,
+            label=self.label,
+        )
+        self.status = "Saved input, overlay, and mask."
 
     def run(self) -> None:
         cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
         cv2.setMouseCallback(WINDOW, self.mouse_callback)
 
-        while True:
-            view = self.draw()
-            cv2.imshow(WINDOW, view)
+        with StereoCamera() as cam:
+            print("[INFO] Opening stereo camera...")
+            cam.require_stereo_shape()
+            cam.warmup()
 
-            key = cv2.waitKey(20) & 0xFF
+            print("[READY]")
+            print("  SPACE  = take snapshot")
+            print("  b      = box prompt")
+            print("  left click  = positive point")
+            print("  right click = negative point")
+            print("  p      = predict")
+            print("  n      = next mask")
+            print("  t      = enter text label/note")
+            print("  s      = save")
+            print("  c      = clear")
+            print("  q/Esc  = quit")
 
-            if key in (ord("q"), 27):
-                break
+            while True:
+                view = self.draw()
+                cv2.imshow(WINDOW, view)
 
-            elif key == ord("b"):
-                self.select_box()
+                key = cv2.waitKey(20) & 0xFF
 
-            elif key == ord("p"):
-                self.predict()
+                if key in (ord("q"), 27):
+                    break
 
-            elif key == ord("n"):
-                self.cycle_mask()
+                elif key == ord(" "):
+                    self.take_snapshot(cam)
 
-            elif key == ord("c"):
-                self.clear_prompts()
+                elif key == ord("b"):
+                    self.select_box()
 
-            elif key == ord("s"):
-                overlay = self.draw()
-                save_outputs(self.out_dir, self.image_bgr, overlay, self.current_mask)
+                elif key == ord("p"):
+                    self.predict()
+
+                elif key == ord("n"):
+                    self.cycle_mask()
+
+                elif key == ord("t"):
+                    self.enter_label()
+
+                elif key == ord("s"):
+                    self.save()
+
+                elif key == ord("c"):
+                    self.clear_prompts()
 
         cv2.destroyAllWindows()
 
@@ -415,12 +449,12 @@ class SamMaskTester:
 def main() -> None:
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--image", type=Path, default=None, help="Single image to segment.")
-    parser.add_argument("--index", type=int, default=0, help="Stereo pair index from capture folders.")
-    parser.add_argument("--left-dir", type=Path, default=config.CAPTURE_LEFT_DIR)
-    parser.add_argument("--right-dir", type=Path, default=config.CAPTURE_RIGHT_DIR)
-    parser.add_argument("--rectify", action="store_true", help="Rectify left image before SAM.")
-    parser.add_argument("--checkpoint", type=Path, required=True, help="SAM checkpoint .pth file.")
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        required=True,
+        help="Path to SAM checkpoint, e.g. workspace/models/sam_vit_b.pth",
+    )
     parser.add_argument(
         "--model-type",
         type=str,
@@ -429,10 +463,15 @@ def main() -> None:
         help="SAM model type. vit_b is fastest/smallest.",
     )
     parser.add_argument(
+        "--rectify",
+        action="store_true",
+        help="Rectify the left image before SAM.",
+    )
+    parser.add_argument(
         "--out-dir",
         type=Path,
-        default=config.CALIBRATION_ROOT / "sam_mask_tests",
-        help="Output folder for masks and overlays.",
+        default=config.CALIBRATION_ROOT / "sam_live_snapshot_tests",
+        help="Folder for saved masks and overlays.",
     )
 
     args = parser.parse_args()
@@ -440,9 +479,8 @@ def main() -> None:
     if not args.checkpoint.exists():
         raise FileNotFoundError(f"SAM checkpoint not found: {args.checkpoint}")
 
-    image_bgr, label = load_input_image(args)
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
     print(f"[INFO] Device: {device}")
     print(f"[INFO] Loading SAM model: {args.model_type}")
     print(f"[INFO] Checkpoint: {args.checkpoint}")
@@ -452,14 +490,13 @@ def main() -> None:
 
     predictor = SamPredictor(sam)
 
-    tester = SamMaskTester(
-        image_bgr=image_bgr,
+    tool = LiveSamSnapshotTool(
         predictor=predictor,
+        rectify=args.rectify,
         out_dir=args.out_dir,
-        label=label,
     )
 
-    tester.run()
+    tool.run()
 
 
 if __name__ == "__main__":
