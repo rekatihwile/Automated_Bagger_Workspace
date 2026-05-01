@@ -8,3 +8,14 @@
 *.mkv
 *.webm
 *.pt
+*.ply
+*.pth
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.gif
+*.zip
+*.tar
+*.gz
+*.7z
