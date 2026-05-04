@@ -30,6 +30,7 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 
 import cv2
 import numpy as np
@@ -305,12 +306,14 @@ class SnapshotSession:
             print("[WARN] Add a point or draw a box first (left click / right click / b).")
             return
 
-        masks, scores, _ = self.predictor.predict(
+        masks_raw, scores_raw, _ = self.predictor.predict(
             point_coords=point_coords,
             point_labels=point_labels,
             box=box_np,
             multimask_output=True,
         )
+        masks = cast(np.ndarray, masks_raw)
+        scores = cast(np.ndarray, scores_raw)
         self.masks = masks
         self.scores = scores
         self.mask_idx = int(np.argmax(scores))
@@ -321,12 +324,14 @@ class SnapshotSession:
         if self.right_image_bgr is not None:
             print("[INFO] Running SAM on right image …")
             self.predictor.set_image(cv2.cvtColor(self.right_image_bgr, cv2.COLOR_BGR2RGB))
-            right_masks, right_scores, _ = self.predictor.predict(
+            right_masks_raw, right_scores_raw, _ = self.predictor.predict(
                 point_coords=point_coords,
                 point_labels=point_labels,
                 box=box_np,
                 multimask_output=True,
             )
+            right_masks = cast(np.ndarray, right_masks_raw)
+            right_scores = cast(np.ndarray, right_scores_raw)
             self.right_masks = right_masks
             for i, s in enumerate(right_scores):
                 marker = " <--" if i == self.mask_idx else ""
@@ -373,8 +378,10 @@ class SnapshotSession:
         pair_dir = self.pairs_dir / f"pair_{idx:06d}"
         pair_dir.mkdir(parents=True, exist_ok=True)
 
-        has_left_mask  = self.current_mask       is not None
-        has_right_mask = self.current_right_mask is not None
+        left_mask = self.current_mask
+        right_mask = self.current_right_mask
+        has_left_mask  = left_mask  is not None
+        has_right_mask = right_mask is not None
 
         # Rectified images
         cv2.imwrite(str(pair_dir / "left_rect.png"), self.image_bgr)
@@ -385,21 +392,21 @@ class SnapshotSession:
         if has_left_mask:
             cv2.imwrite(
                 str(pair_dir / "left_mask.png"),
-                (self.current_mask > 0).astype(np.uint8) * 255,
+                (left_mask > 0).astype(np.uint8) * 255,
             )
         if has_right_mask:
             cv2.imwrite(
                 str(pair_dir / "right_mask.png"),
-                (self.current_right_mask > 0).astype(np.uint8) * 255,
+                (right_mask > 0).astype(np.uint8) * 255,
             )
 
         # Clean overlays (no prompt dots or box — just mask color)
-        left_overlay = _make_overlay(self.image_bgr, self.current_mask, [], [], None, [])
+        left_overlay = _make_overlay(self.image_bgr, left_mask, [], [], None, [])
         cv2.imwrite(str(pair_dir / "left_overlay.png"), left_overlay)
 
         if self.right_image_bgr is not None:
             right_overlay = _make_overlay(
-                self.right_image_bgr, self.current_right_mask, [], [], None, []
+                self.right_image_bgr, right_mask, [], [], None, []
             )
             cv2.imwrite(str(pair_dir / "right_overlay.png"), right_overlay)
 

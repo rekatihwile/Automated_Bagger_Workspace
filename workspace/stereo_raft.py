@@ -11,6 +11,7 @@ from __future__ import annotations
 import sys
 from argparse import Namespace
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -53,19 +54,19 @@ def _make_raft_args(
     )
 
 
-def _image_to_tensor(bgr: np.ndarray, device: torch.device) -> torch.Tensor:
+def _image_to_tensor(bgr: np.ndarray, device: Any) -> torch.Tensor:
     if bgr.ndim != 3 or bgr.shape[2] != 3:
         raise ValueError(f"Expected HxWx3 BGR image, got shape {bgr.shape}")
 
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    tensor = torch.from_numpy(rgb).permute(2, 0, 1).float()
+    tensor = torch.from_numpy(rgb).permute(2, 0, 1).float()  # type: ignore[reportPrivateImportUsage]
     return tensor[None].to(device)
 
 
 def _load_checkpoint(
     model: torch.nn.Module,
     checkpoint_path: Path,
-    device: torch.device,
+    device: Any,
 ) -> None:
     state = torch.load(str(checkpoint_path), map_location=device)
     if isinstance(state, dict):
@@ -120,7 +121,7 @@ def compute_raft_disparity(
     from core.raft_stereo import RAFTStereo  # type: ignore
     from core.utils.utils import InputPadder  # type: ignore
 
-    torch_device = torch.device(
+    torch_device = torch.device(  # type: ignore[reportPrivateImportUsage]
         device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
     )
     use_mixed_precision = bool(mixed_precision and torch_device.type == "cuda")

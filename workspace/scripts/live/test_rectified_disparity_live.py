@@ -49,6 +49,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 
 import cv2
 import numpy as np
@@ -576,13 +577,15 @@ class SnapshotSession:
             )
             return
 
-        masks, scores, _ = predictor.predict(
+        masks_raw, scores_raw, _ = predictor.predict(
             point_coords=point_coords,
             point_labels=point_labels,
             box=box_np,
             multimask_output=True,
         )
 
+        masks = cast(np.ndarray, masks_raw)
+        scores = cast(np.ndarray, scores_raw)
         state.masks = masks
         state.scores = scores
         state.mask_idx = int(np.argmax(scores))

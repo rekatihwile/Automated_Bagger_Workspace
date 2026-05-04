@@ -4,6 +4,13 @@
     "${workspaceFolder}",
     "${workspaceFolder}/workspace"
   ],
+  "python.analysis.exclude": [
+    "**/.venv",
+    "**/__pycache__",
+    "**/calibration",
+    "**/external",
+    "**/workspace/_archive_old_python_20260420"
+  ],
   "python.analysis.typeCheckingMode": "basic",
   "files.exclude": {
     "**/__pycache__": true,

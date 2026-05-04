@@ -1,0 +1,18 @@
+{
+  "include": [
+    "workspace"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    ".venv",
+    "calibration",
+    "external",
+    "workspace/_archive_old_python_20260420"
+  ],
+  "extraPaths": [
+    "workspace"
+  ],
+  "venvPath": ".",
+  "venv": ".venv",
+  "typeCheckingMode": "basic"
+}

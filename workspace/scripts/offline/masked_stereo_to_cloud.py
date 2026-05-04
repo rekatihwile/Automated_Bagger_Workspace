@@ -105,7 +105,7 @@ SCALE_TO_METERS = 0.001
 def _make_sgbm(num_disparities: int, block_size: int) -> cv2.StereoSGBM:
     num_disparities = max(16, int(round(num_disparities / 16)) * 16)
     block_size      = max(3, block_size | 1)   # ensure odd and >= 3
-    return cv2.StereoSGBM_create(
+    return cv2.StereoSGBM_create(  # type: ignore[attr-defined]
         minDisparity=0,
         numDisparities=num_disparities,
         blockSize=block_size,
@@ -519,6 +519,12 @@ def main() -> None:
     left_bgr  = _load("left_rect.png")
     right_bgr = _load("right_rect.png")
     left_mask_orig = _load("left_mask.png", cv2.IMREAD_GRAYSCALE)
+    if left_bgr is None:
+        raise FileNotFoundError(f"Could not read left image: {pair_dir / 'left_rect.png'}")
+    if right_bgr is None:
+        raise FileNotFoundError(f"Could not read right image: {pair_dir / 'right_rect.png'}")
+    if left_mask_orig is None:
+        raise FileNotFoundError(f"Could not read left mask: {pair_dir / 'left_mask.png'}")
 
     # right_mask is optional in left-only mode
     right_mask_orig: np.ndarray | None
@@ -526,6 +532,8 @@ def main() -> None:
         right_mask_orig = _load("right_mask.png", cv2.IMREAD_GRAYSCALE, required=False)
     else:
         right_mask_orig = _load("right_mask.png", cv2.IMREAD_GRAYSCALE, required=True)
+        if right_mask_orig is None:
+            raise FileNotFoundError(f"Could not read right mask: {pair_dir / 'right_mask.png'}")
 
     h, w = left_bgr.shape[:2]
     print(f"[INFO] Image size      : {w}×{h}")

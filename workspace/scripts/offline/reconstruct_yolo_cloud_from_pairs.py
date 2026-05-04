@@ -120,7 +120,7 @@ def make_sgbm(num_disparities: int = 128, block_size: int = 7) -> cv2.StereoSGBM
         block_size += 1
     block_size = max(3, block_size)
 
-    return cv2.StereoSGBM_create(
+    return cv2.StereoSGBM_create(  # type: ignore[attr-defined]
         minDisparity=0,
         numDisparities=num_disparities,
         blockSize=block_size,
@@ -181,7 +181,10 @@ def clean_mask(mask: np.ndarray, open_size: int = 5, close_size: int = 9) -> np.
 
 def largest_component(mask: np.ndarray) -> np.ndarray:
     mask_bool = mask > 0
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask_bool.astype(np.uint8), 8)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask_bool.astype(np.uint8),
+        connectivity=8,
+    )
 
     if n <= 1:
         return mask
