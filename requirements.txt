@@ -10,4 +10,5 @@ opt_einsum
 scipy
 imageio
 scikit-image
+pyserial
 

@@ -75,6 +75,14 @@ PANEL_HEIGHT = 142
 GUIDE_SPACING_PX = 40
 MIN_DISPARITY = 1.0
 SCALE_TO_METERS = 0.001
+
+# Applied after camera points are transformed into the ArUco workspace frame.
+# Use this to calibrate height against a known object:
+#   1. Run with 1.0 and note h_est.
+#   2. Set WORKSPACE_Z_SCALE = h_known / h_est.
+#   3. Rerun; workspace cloud Z and height metrics are scaled by this factor.
+WORKSPACE_Z_SCALE = 0.1/0.0823
+
 MAX_OBJECT_POINTS = 80_000
 VOXEL_SIZE_M = 0.003
 # =========================================================
@@ -285,6 +293,12 @@ def reproject_disparity_to_points(
 ) -> np.ndarray:
     points_raw = cv2.reprojectImageTo3D(disparity.astype(np.float32), q_matrix)
     return points_raw.astype(np.float64) * float(scale_to_meters)
+
+
+def apply_workspace_z_scale(points_workspace_m: np.ndarray, z_scale: float) -> np.ndarray:
+    points_scaled = np.asarray(points_workspace_m, dtype=np.float64).copy()
+    points_scaled[:, 2] *= float(z_scale)
+    return points_scaled
 
 
 def fit_plane_from_points(points_m: np.ndarray) -> PlaneModel:
@@ -499,6 +513,7 @@ def compute_object_metrics_workspace(
             "footprint_centroid_m": [float("nan")] * 3,
             "filter_method": filter_method,
             "frame": "aruco_workspace",
+            "workspace_z_scale": float("nan"),
         }
 
     centroid = np.mean(points_workspace_m, axis=0)
@@ -1168,8 +1183,13 @@ class ArUcoWorkspaceSession:
             return
 
         # CRITICAL FIX:
-        # Convert camera-frame object cloud into fixed ArUco workspace frame.
-        points_workspace_m = self.workspace_frame.camera_to_workspace_points(points_cam_m)
+        # Convert camera-frame object cloud into fixed ArUco workspace frame,
+        # then apply the user-calibrated Z scale.
+        points_workspace_unscaled_m = self.workspace_frame.camera_to_workspace_points(points_cam_m)
+        points_workspace_m = apply_workspace_z_scale(
+            points_workspace_unscaled_m,
+            float(self.args.workspace_z_scale),
+        )
 
         object_id = len(self.objects)
 
@@ -1179,6 +1199,11 @@ class ArUcoWorkspaceSession:
             points_workspace_m,
             method,
         )
+        metrics["workspace_z_scale"] = float(self.args.workspace_z_scale)
+
+        raw_z = points_workspace_unscaled_m[:, 2]
+        raw_p05, raw_p95 = np.percentile(raw_z, [5, 95])
+        metrics["height_estimate_unscaled_m"] = float(raw_p95 - raw_p05)
 
         result = ObjectResult(
             object_id=object_id,
@@ -1215,12 +1240,16 @@ class ArUcoWorkspaceSession:
     def _print_object_result(self, metrics: dict[str, float | int | list[float] | str]) -> None:
         z50 = float(cast(float | int, metrics["height_p50_m"]))
         h_est = float(cast(float | int, metrics["height_estimate_m"]))
+        h_unscaled = float(cast(float | int, metrics.get("height_estimate_unscaled_m", h_est)))
+        z_scale = float(cast(float | int, metrics.get("workspace_z_scale", 1.0)))
 
         print(
             f"[OBJECT] id={metrics['object_id']}  "
             f"pts={metrics['point_count']}  "
             f"z50={z50:.4f} m  "
-            f"h_est={h_est:.4f} m"
+            f"h_est={h_est:.4f} m  "
+            f"h_unscaled={h_unscaled:.4f} m  "
+            f"z_scale={z_scale:.4f}"
         )
 
     # ------------------------------------------------------------------
@@ -1275,7 +1304,10 @@ class ArUcoWorkspaceSession:
             return
 
         floor_pts_cam = np.vstack([self.corners_m[r] for r in corner_order[:4]])
-        floor_pts_workspace = self.workspace_frame.camera_to_workspace_points(floor_pts_cam)
+        floor_pts_workspace = apply_workspace_z_scale(
+            self.workspace_frame.camera_to_workspace_points(floor_pts_cam),
+            float(self.args.workspace_z_scale),
+        )
 
         save_scene_ply(
             self.run_dir / "workspace_floor_and_objects.ply",
@@ -1299,6 +1331,8 @@ class ArUcoWorkspaceSession:
             "height_p50_m",
             "height_p95_m",
             "height_estimate_m",
+            "height_estimate_unscaled_m",
+            "workspace_z_scale",
         ]
 
         with (self.run_dir / "summary.csv").open("w", newline="", encoding="utf-8") as f:
@@ -1315,11 +1349,19 @@ class ArUcoWorkspaceSession:
             "raft_checkpoint": str(self.args.raft_checkpoint),
             "sam_model_path": str(self.args.sam_model_path),
             "scale_to_meters": float(self.args.scale_to_meters),
+            "workspace_z_scale": float(self.args.workspace_z_scale),
             "aruco_marker_ids": {r: mid for mid, r in ROLE_BY_ID.items()},
             "corners_pixels_left": {r: list(px) for r, px in self.pixels_left.items()},
             "corners_pixels_right": {r: list(px) for r, px in self.pixels_right.items()},
             "corners_camera_m": {r: pt.tolist() for r, pt in self.corners_m.items()},
             "corners_workspace_m": {
+                r: apply_workspace_z_scale(
+                    self.workspace_frame.camera_to_workspace_point(pt)[None, :],
+                    float(self.args.workspace_z_scale),
+                )[0].tolist()
+                for r, pt in self.corners_m.items()
+            },
+            "corners_workspace_unscaled_m": {
                 r: self.workspace_frame.camera_to_workspace_point(pt).tolist()
                 for r, pt in self.corners_m.items()
             },
@@ -1373,7 +1415,7 @@ class ArUcoWorkspaceSession:
         )
 
         lines = [
-            "Object prompts on LEFT image. Saved clouds are transformed into ArUco workspace frame.",
+            f"Saved clouds use ArUco workspace frame. Z scale: {float(self.args.workspace_z_scale):.4f}.",
             "b draw box. left/right mouse = SAM positive/negative point.",
             "p preview mask. s save workspace cloud. n new prompt. c clear prompt.",
             "z finish and write combined workspace PLY. q/Esc quit.",
@@ -1470,6 +1512,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--guide-spacing", type=int, default=GUIDE_SPACING_PX)
     parser.add_argument("--min-disparity", type=float, default=MIN_DISPARITY)
     parser.add_argument("--scale-to-meters", type=float, default=SCALE_TO_METERS)
+    parser.add_argument("--workspace-z-scale", type=float, default=WORKSPACE_Z_SCALE)
     parser.add_argument("--max-points", type=int, default=MAX_OBJECT_POINTS)
     parser.add_argument("--voxel-size-m", type=float, default=VOXEL_SIZE_M)
 
@@ -1486,6 +1529,8 @@ def main() -> None:
 
     if not args.use_raft:
         raise ValueError("This script requires RAFT disparity. Use --use-raft.")
+
+    print(f"[CONFIG] workspace_z_scale={float(args.workspace_z_scale):.6f}")
 
     calib = load_calibration()
 

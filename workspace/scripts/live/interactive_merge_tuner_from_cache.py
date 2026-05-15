@@ -11,10 +11,13 @@ Run a specific capture:
     python .\interactive_merge_tuner_from_cache.py --run-dir "C:\path\to\pipeline_YYYYMMDD_HHMMSS"
 
 Controls:
-    r = recompute, KEEP CURRENT VIEW
-    v = reset view manually
-    s = save tuned outputs
-    q / Esc = quit
+    Tkinter panel: Recompute | Reset View | Save Auto Config + Run Outputs | Save Best Config | Quit
+    Keyboard (in Open3D window):
+        r = recompute
+        v = reset view
+        s = save auto config + run outputs
+        b = save best config
+        q / Esc = quit
 """
 
 from __future__ import annotations
@@ -27,6 +30,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+import tkinter as tk
+from tkinter import ttk
 
 import cv2
 import numpy as np
@@ -67,6 +73,30 @@ AXIS_SIZE_M = 0.10
 
 FLOOR_COLOR = np.array([[0.35, 0.45, 0.55]], dtype=np.float64)
 
+# Workspace grid
+WORKSPACE_GRID_SPACING_M = 0.05
+WORKSPACE_AXIS_LENGTH_M = 0.15
+
+# Height metrics
+HEIGHT_LOW_PERCENTILE = 2.0
+HEIGHT_HIGH_PERCENTILE = 95.0
+HEIGHT_TOP_PERCENTILE = 95.0
+HEIGHT_BOTTOM_PERCENTILE = 5.0
+HEIGHT_MIN_POINTS = 50
+
+# Presentation mesh
+ENABLE_PRESENTATION_MESH_OUTPUTS = True
+ENABLE_RADIUS_OUTLIER_REMOVAL = True
+RADIUS_OUTLIER_NB_POINTS = 8
+RADIUS_OUTLIER_RADIUS_M = 0.01
+ENABLE_NORMAL_ESTIMATION = True
+NORMAL_RADIUS_M = 0.015
+NORMAL_MAX_NN = 30
+ENABLE_MESH_BALL_PIVOTING = True
+BALL_PIVOT_RADII_M = [0.004, 0.008, 0.012]
+ENABLE_MESH_SMOOTHING = True
+MESH_SMOOTHING_ITERATIONS = 3
+
 # -----------------------------------------------------------------------------
 # Data containers
 # -----------------------------------------------------------------------------
@@ -83,6 +113,7 @@ class CachedObjectView:
 class TunerParams:
     use_icp: bool
     translation_only: bool
+    use_colored_icp: bool
     max_yaw_deg: float
     icp_threshold_m: float
     icp_voxel_m: float
@@ -418,20 +449,38 @@ def run_limited_icp(
             "reason": "empty_downsample",
         }
 
-    estimation = o3d.pipelines.registration.TransformationEstimationPointToPoint(False)
+    result = None
+    method_used = "point_to_point"
 
-    result = o3d.pipelines.registration.registration_icp(
-        src_down,
-        ref_down,
-        params.icp_threshold_m,
-        np.eye(4),
-        estimation,
-        o3d.pipelines.registration.ICPConvergenceCriteria(
-            max_iteration=80,
-            relative_fitness=1e-7,
-            relative_rmse=1e-7,
-        ),
-    )
+    if params.use_colored_icp:
+        try:
+            src_down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=params.icp_voxel_m * 3, max_nn=30))
+            ref_down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=params.icp_voxel_m * 3, max_nn=30))
+            result = o3d.pipelines.registration.registration_colored_icp(
+                src_down, ref_down, params.icp_threshold_m, np.eye(4),
+                o3d.pipelines.registration.TransformationEstimationForColoredICP(),
+                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=80, relative_fitness=1e-7, relative_rmse=1e-7),
+            )
+            method_used = "colored_icp"
+        except Exception as exc:
+            print(f"[WARN] Colored ICP failed ({exc}), falling back.")
+            result = None
+
+    if result is None:
+        estimation = o3d.pipelines.registration.TransformationEstimationPointToPoint(False)
+        result = o3d.pipelines.registration.registration_icp(
+            src_down,
+            ref_down,
+            params.icp_threshold_m,
+            np.eye(4),
+            estimation,
+            o3d.pipelines.registration.ICPConvergenceCriteria(
+                max_iteration=80,
+                relative_fitness=1e-7,
+                relative_rmse=1e-7,
+            ),
+        )
+        method_used = "point_to_point"
 
     T = result.transformation.copy()
 
@@ -456,6 +505,7 @@ def run_limited_icp(
         return source, {
             "used": True,
             "accepted": False,
+            "method": method_used,
             "fitness": float(result.fitness),
             "rmse": float(result.inlier_rmse),
             "translation_m": translation_m,
@@ -468,6 +518,7 @@ def run_limited_icp(
     return aligned, {
         "used": True,
         "accepted": True,
+        "method": method_used,
         "fitness": float(result.fitness),
         "rmse": float(result.inlier_rmse),
         "translation_m": translation_m,
@@ -520,17 +571,18 @@ def load_cached_dataset(run_dir: Path) -> dict[str, Any]:
 def recompute_merge(
     dataset: dict[str, Any],
     params: TunerParams,
-) -> tuple[o3d.geometry.PointCloud, o3d.geometry.PointCloud, dict[str, Any]]:
+) -> tuple[o3d.geometry.PointCloud, o3d.geometry.PointCloud, list, list, dict[str, Any]]:
+    """Returns (corner_merged, icp_merged, per_obj_corner_pcds, per_obj_icp_pcds, debug)."""
     ref_corners = dataset["ref_corners"]
     src_corners = dataset["src_corners"]
     ref_frame = dataset["ref_frame"]
 
-    corner_clouds = []
-    icp_clouds = []
+    corner_clouds: list[o3d.geometry.PointCloud] = []
+    icp_clouds: list[o3d.geometry.PointCloud] = []
+    per_obj_corner: list[o3d.geometry.PointCloud] = []
+    per_obj_icp: list[o3d.geometry.PointCloud] = []
 
-    debug = {
-        "objects": [],
-    }
+    debug: dict[str, Any] = {"objects": []}
 
     for object_id in dataset["object_ids"]:
         ref_obj: CachedObjectView = dataset["objects"][object_id][0]
@@ -553,39 +605,22 @@ def recompute_merge(
         ref_pcd = np_to_o3d_cloud(ref_local, ref_obj.colors_bgr)
         src_corner_pcd = np_to_o3d_cloud(src_local, src_obj.colors_bgr)
 
-        corner_pair = merge_clouds([ref_pcd, src_corner_pcd])
+        corner_pair = safe_downsample(safe_remove_outliers(merge_clouds([ref_pcd, src_corner_pcd])), params.final_voxel_m)
         corner_clouds.append(corner_pair)
+        per_obj_corner.append(corner_pair)
 
-        src_icp_pcd, icp_info = run_limited_icp(
-            src_corner_pcd,
-            ref_pcd,
-            params,
-        )
+        src_icp_pcd, icp_info = run_limited_icp(src_corner_pcd, ref_pcd, params)
 
-        icp_pair = merge_clouds([ref_pcd, src_icp_pcd])
+        icp_pair = safe_downsample(safe_remove_outliers(merge_clouds([ref_pcd, src_icp_pcd])), params.final_voxel_m)
         icp_clouds.append(icp_pair)
+        per_obj_icp.append(icp_pair)
 
-        debug["objects"].append(
-            {
-                "object_id": object_id,
-                "icp": icp_info,
-            }
-        )
+        debug["objects"].append({"object_id": object_id, "icp": icp_info})
 
     corner_merged = merge_clouds(corner_clouds)
     icp_merged = merge_clouds(icp_clouds)
 
-    corner_merged = safe_downsample(
-        safe_remove_outliers(corner_merged),
-        params.final_voxel_m,
-    )
-
-    icp_merged = safe_downsample(
-        safe_remove_outliers(icp_merged),
-        params.final_voxel_m,
-    )
-
-    return corner_merged, icp_merged, debug
+    return corner_merged, icp_merged, per_obj_corner, per_obj_icp, debug
 
 
 # -----------------------------------------------------------------------------
@@ -678,51 +713,304 @@ def make_axis_gizmo(size: float = AXIS_SIZE_M) -> o3d.geometry.TriangleMesh:
 
 
 # -----------------------------------------------------------------------------
-# Trackbar controls
+# Height metrics helpers
 # -----------------------------------------------------------------------------
 
-def setup_controls() -> None:
-    cv2.namedWindow(CONTROL_WINDOW, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(CONTROL_WINDOW, 520, 520)
-
-    cv2.createTrackbar("view ICP", CONTROL_WINDOW, 1, 1, lambda x: None)
-    cv2.createTrackbar("use ICP", CONTROL_WINDOW, 1, 1, lambda x: None)
-    cv2.createTrackbar("translation only", CONTROL_WINDOW, 0, 1, lambda x: None)
-    cv2.createTrackbar("ICP threshold mm", CONTROL_WINDOW, 6, 60, lambda x: None)
-    cv2.createTrackbar("ICP voxel mm", CONTROL_WINDOW, 3, 20, lambda x: None)
-    cv2.createTrackbar("max yaw deg", CONTROL_WINDOW, 5, 45, lambda x: None)
-    cv2.createTrackbar("final voxel mm", CONTROL_WINDOW, 2, 20, lambda x: None)
-    cv2.createTrackbar("x shift mm +100", CONTROL_WINDOW, 100, 200, lambda x: None)
-    cv2.createTrackbar("y shift mm +100", CONTROL_WINDOW, 100, 200, lambda x: None)
-    cv2.createTrackbar("z shift mm +100", CONTROL_WINDOW, 100, 200, lambda x: None)
-    cv2.createTrackbar("z scale percent", CONTROL_WINDOW, 100, 150, lambda x: None)
-
-
-def read_params() -> TunerParams:
-    threshold_mm = max(1, cv2.getTrackbarPos("ICP threshold mm", CONTROL_WINDOW))
-    icp_voxel_mm = max(1, cv2.getTrackbarPos("ICP voxel mm", CONTROL_WINDOW))
-    final_voxel_mm = max(1, cv2.getTrackbarPos("final voxel mm", CONTROL_WINDOW))
-    z_scale_percent = max(50, cv2.getTrackbarPos("z scale percent", CONTROL_WINDOW))
-
-    return TunerParams(
-        use_icp=bool(cv2.getTrackbarPos("use ICP", CONTROL_WINDOW)),
-        translation_only=bool(cv2.getTrackbarPos("translation only", CONTROL_WINDOW)),
-        max_yaw_deg=float(cv2.getTrackbarPos("max yaw deg", CONTROL_WINDOW)),
-        icp_threshold_m=threshold_mm / 1000.0,
-        icp_voxel_m=icp_voxel_mm / 1000.0,
-        final_voxel_m=final_voxel_mm / 1000.0,
-        x_shift_m=(cv2.getTrackbarPos("x shift mm +100", CONTROL_WINDOW) - 100) / 1000.0,
-        y_shift_m=(cv2.getTrackbarPos("y shift mm +100", CONTROL_WINDOW) - 100) / 1000.0,
-        z_shift_m=(cv2.getTrackbarPos("z shift mm +100", CONTROL_WINDOW) - 100) / 1000.0,
-        z_scale=z_scale_percent / 100.0,
-        view_mode_icp=bool(cv2.getTrackbarPos("view ICP", CONTROL_WINDOW)),
-    )
+def compute_object_height_metrics(points_local: np.ndarray, object_id: int) -> dict:
+    pts = np.asarray(points_local, dtype=np.float64)
+    n = len(pts)
+    if n < HEIGHT_MIN_POINTS:
+        return {"object_id": object_id, "valid": False, "point_count": n}
+    z = pts[:, 2]
+    centroid = pts.mean(axis=0)
+    bbox_min = pts.min(axis=0)
+    bbox_max = pts.max(axis=0)
+    dims = bbox_max - bbox_min
+    z_low = float(np.percentile(z, HEIGHT_LOW_PERCENTILE))
+    z_high = float(np.percentile(z, HEIGHT_HIGH_PERCENTILE))
+    z_top = float(np.percentile(z, HEIGHT_TOP_PERCENTILE))
+    z_bottom = float(np.percentile(z, HEIGHT_BOTTOM_PERCENTILE))
+    robust_h = z_high - z_low
+    return {
+        "object_id": object_id, "valid": True, "point_count": n,
+        "centroid_x_m": float(centroid[0]), "centroid_y_m": float(centroid[1]), "centroid_z_m": float(centroid[2]),
+        "bbox_width_x_m": float(dims[0]), "bbox_depth_y_m": float(dims[1]), "bbox_height_z_raw_m": float(dims[2]),
+        "robust_height_m": robust_h, "robust_height_cm": robust_h * 100.0,
+        "floor_relative_top_height_m": z_top, "floor_relative_top_height_cm": z_top * 100.0,
+        "floor_relative_top_height_mm": z_top * 1000.0,
+        "floor_relative_bottom_m": z_bottom,
+    }
 
 
-def params_key(params: TunerParams) -> tuple:
+def print_height_metrics_table(label: str, metrics: list) -> None:
+    print(f"\n[HEIGHT METRICS - {label}]")
+    print(f"{'obj':>4} | {'pts':>6} | {'cx_cm':>6} | {'cy_cm':>6} | {'top_cm':>7} | {'robust_cm':>9} | {'bbox_x_cm':>9} | {'bbox_y_cm':>9}")
+    print("-" * 75)
+    for m in metrics:
+        if not m.get("valid"):
+            print(f"{m['object_id']:>4} | INVALID (pts={m['point_count']})")
+            continue
+        print(
+            f"{m['object_id']:>4} | {m['point_count']:>6} | "
+            f"{m['centroid_x_m']*100:>6.1f} | {m['centroid_y_m']*100:>6.1f} | "
+            f"{m['floor_relative_top_height_cm']:>7.2f} | {m['robust_height_cm']:>9.2f} | "
+            f"{m['bbox_width_x_m']*100:>9.2f} | {m['bbox_depth_y_m']*100:>9.2f}"
+        )
+
+
+def save_height_metrics(output_dir: Path, prefix: str, metrics: list) -> None:
+    import csv
+    json_path = output_dir / f"{prefix}.json"
+    csv_path = output_dir / f"{prefix}.csv"
+    json_path.write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
+    if not metrics:
+        return
+    keys = list(metrics[0].keys())
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(metrics)
+    print(f"[SAVE] {csv_path}")
+
+
+# -----------------------------------------------------------------------------
+# Workspace grid / axes helpers
+# -----------------------------------------------------------------------------
+
+def _make_grid_lineset(floor_corners_local: np.ndarray) -> o3d.geometry.LineSet:
+    import math
+    pts = np.asarray(floor_corners_local, dtype=np.float64)
+    x0, x1 = float(pts[:, 0].min()), float(pts[:, 0].max())
+    y0, y1 = float(pts[:, 1].min()), float(pts[:, 1].max())
+    z = float(np.median(pts[:, 2]))
+    spacing = WORKSPACE_GRID_SPACING_M
+
+    points: list[list[float]] = []
+    lines_list: list[list[int]] = []
+    colors: list[list[float]] = []
+
+    def add_line(p1: list[float], p2: list[float], color: list[float]) -> None:
+        idx = len(points)
+        points.append(p1)
+        points.append(p2)
+        lines_list.append([idx, idx + 1])
+        colors.append(color)
+
+    grid_color = [0.55, 0.58, 0.62]
+    border_color = [0.9, 0.9, 0.4]
+
+    xs = np.arange(math.ceil(x0 / spacing) * spacing, x1 + spacing * 0.01, spacing)
+    for x in xs:
+        add_line([float(x), y0, z], [float(x), y1, z], grid_color)
+    ys = np.arange(math.ceil(y0 / spacing) * spacing, y1 + spacing * 0.01, spacing)
+    for y in ys:
+        add_line([x0, float(y), z], [x1, float(y), z], grid_color)
+    bdr = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+    for i in range(4):
+        a, b = bdr[i], bdr[(i + 1) % 4]
+        add_line([a[0], a[1], z], [b[0], b[1], z], border_color)
+
+    ls = o3d.geometry.LineSet()
+    ls.points = o3d.utility.Vector3dVector(points)
+    ls.lines = o3d.utility.Vector2iVector(lines_list)
+    ls.colors = o3d.utility.Vector3dVector(colors)
+    return ls
+
+
+def _make_axes_lineset() -> o3d.geometry.LineSet:
+    L = WORKSPACE_AXIS_LENGTH_M
+    points = [[0, 0, 0], [L, 0, 0], [0, 0, 0], [0, L, 0], [0, 0, 0], [0, 0, L]]
+    lines_idx = [[0, 1], [2, 3], [4, 5]]
+    colors = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    ls = o3d.geometry.LineSet()
+    ls.points = o3d.utility.Vector3dVector(points)
+    ls.lines = o3d.utility.Vector2iVector(lines_idx)
+    ls.colors = o3d.utility.Vector3dVector(colors)
+    return ls
+
+
+# -----------------------------------------------------------------------------
+# Presentation mesh helpers
+# -----------------------------------------------------------------------------
+
+def _clean_cloud_for_presentation(pcd: o3d.geometry.PointCloud) -> o3d.geometry.PointCloud:
+    out = pcd
+    if ENABLE_RADIUS_OUTLIER_REMOVAL and len(out.points) >= RADIUS_OUTLIER_NB_POINTS:
+        out, _ = out.remove_radius_outlier(nb_points=RADIUS_OUTLIER_NB_POINTS, radius=RADIUS_OUTLIER_RADIUS_M)
+    if ENABLE_NORMAL_ESTIMATION and len(out.points) > 0:
+        out.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=NORMAL_RADIUS_M, max_nn=NORMAL_MAX_NN))
+        out.orient_normals_consistent_tangent_plane(30)
+    return out
+
+
+def _save_presentation_outputs(output_dir: Path, prefix: str, pcd: o3d.geometry.PointCloud) -> None:
+    if not ENABLE_PRESENTATION_MESH_OUTPUTS:
+        return
+    try:
+        clean = _clean_cloud_for_presentation(pcd)
+        o3d.io.write_point_cloud(str(output_dir / f"{prefix}_cleaned_cloud.ply"), clean)
+        print(f"[SAVE] {prefix}_cleaned_cloud.ply")
+    except Exception as exc:
+        print(f"[WARN] Presentation clean cloud failed: {exc}")
+        return
+    if ENABLE_MESH_BALL_PIVOTING:
+        try:
+            if not clean.has_normals():
+                clean.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=NORMAL_RADIUS_M, max_nn=NORMAL_MAX_NN))
+            radii = o3d.utility.DoubleVector(BALL_PIVOT_RADII_M)
+            mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(clean, radii)
+            if len(mesh.triangles) > 0:
+                if ENABLE_MESH_SMOOTHING:
+                    mesh = mesh.filter_smooth_taubin(number_of_iterations=MESH_SMOOTHING_ITERATIONS)
+                mesh.compute_vertex_normals()
+                o3d.io.write_triangle_mesh(str(output_dir / f"{prefix}_mesh_ball_pivot.ply"), mesh)
+                print(f"[SAVE] {prefix}_mesh_ball_pivot.ply")
+        except Exception as exc:
+            print(f"[WARN] Presentation mesh failed: {exc}")
+
+
+# -----------------------------------------------------------------------------
+# Tkinter control panel
+# -----------------------------------------------------------------------------
+
+
+class MergeTunerControlPanel:
+    """Tkinter-based control panel replacing OpenCV trackbars."""
+
+    def __init__(self) -> None:
+        self.root = tk.Tk()
+        self.root.title("Merge Tuner Controls")
+        self.root.resizable(False, False)
+
+        self.flag_recompute = False
+        self.flag_reset_view = False
+        self.flag_save = False
+        self.flag_save_best = False
+        self.flag_quit = False
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_quit)
+
+        frame = ttk.Frame(self.root, padding=10)
+        frame.grid(row=0, column=0, sticky="nsew")
+
+        row = 0
+
+        self._view_icp = tk.BooleanVar(value=True)
+        self._use_icp = tk.BooleanVar(value=True)
+        self._trans_only = tk.BooleanVar(value=False)
+        self._colored_icp = tk.BooleanVar(value=False)
+        self._auto_recompute = tk.BooleanVar(value=True)
+
+        def cb(text, var):
+            nonlocal row
+            ttk.Checkbutton(frame, text=text, variable=var).grid(row=row, column=0, columnspan=3, sticky="w", pady=1)
+            row += 1
+
+        cb("Show ICP result (vs corners-only)", self._view_icp)
+        cb("Use ICP", self._use_icp)
+        cb("Translation-only ICP", self._trans_only)
+        cb("Use colored ICP (experimental)", self._colored_icp)
+        cb("Auto recompute on slider change (0.25 s debounce)", self._auto_recompute)
+
+        ttk.Separator(frame, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=6)
+        row += 1
+
+        self._sliders = {}
+        slider_defs = [
+            ("ICP threshold [mm]",    "icp_thresh",  1,    60,   6),
+            ("ICP voxel size [mm]",   "icp_voxel",   1,    20,   3),
+            ("Max yaw rotation [deg]","max_yaw",      0,    45,   5),
+            ("Final voxel size [mm]", "final_voxel", 1,    20,   2),
+            ("X shift [mm]",          "x_shift",   -100,  100,   0),
+            ("Y shift [mm]",          "y_shift",   -100,  100,   0),
+            ("Z shift [mm]",          "z_shift",   -100,  100,   0),
+            ("Z scale [%]",           "z_scale",     50,  150, 100),
+        ]
+        for label, key, lo, hi, default in slider_defs:
+            var = tk.IntVar(value=default)
+            self._sliders[key] = var
+            ttk.Label(frame, text=label, width=30, anchor="w").grid(row=row, column=0, sticky="w")
+            ttk.Scale(frame, from_=lo, to=hi, orient="horizontal", variable=var, length=200,
+                      command=lambda _v, k=key: self._on_slider_change()).grid(row=row, column=1, padx=4)
+            ttk.Label(frame, textvariable=var, width=5).grid(row=row, column=2, sticky="w")
+            row += 1
+
+        ttk.Separator(frame, orient="horizontal").grid(row=row, column=0, columnspan=3, sticky="ew", pady=6)
+        row += 1
+
+        self._status_var = tk.StringVar(value="Ready.")
+        ttk.Label(frame, textvariable=self._status_var, foreground="#007acc", wraplength=420, justify="left").grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        row += 1
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=row, column=0, columnspan=3, pady=4)
+
+        ttk.Button(btn_frame, text="Recompute  [r]",       command=self._on_recompute).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Reset View  [v]",       command=self._on_reset_view).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Save Auto + Run  [s]",  command=self._on_save).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Save Best Config  [b]", command=self._on_save_best).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Quit  [q]",             command=self._on_quit).pack(side="left", padx=4)
+
+        self._last_slider_change = 0.0
+
+    def _on_slider_change(self):
+        self._last_slider_change = time.time()
+
+    def _on_recompute(self):
+        self.flag_recompute = True
+
+    def _on_reset_view(self):
+        self.flag_reset_view = True
+
+    def _on_save(self):
+        self.flag_save = True
+
+    def _on_save_best(self):
+        self.flag_save_best = True
+
+    def _on_quit(self):
+        self.flag_quit = True
+
+    def get_params(self):
+        return TunerParams(
+            use_icp=self._use_icp.get(),
+            translation_only=self._trans_only.get(),
+            use_colored_icp=self._colored_icp.get(),
+            max_yaw_deg=float(self._sliders["max_yaw"].get()),
+            icp_threshold_m=max(1, self._sliders["icp_thresh"].get()) / 1000.0,
+            icp_voxel_m=max(1, self._sliders["icp_voxel"].get()) / 1000.0,
+            final_voxel_m=max(1, self._sliders["final_voxel"].get()) / 1000.0,
+            x_shift_m=self._sliders["x_shift"].get() / 1000.0,
+            y_shift_m=self._sliders["y_shift"].get() / 1000.0,
+            z_shift_m=self._sliders["z_shift"].get() / 1000.0,
+            z_scale=max(50, self._sliders["z_scale"].get()) / 100.0,
+            view_mode_icp=self._view_icp.get(),
+        )
+
+    def auto_recompute_due(self, debounce_s=0.25):
+        if not self._auto_recompute.get():
+            return False
+        return (time.time() - self._last_slider_change) >= debounce_s and self._last_slider_change > 0
+
+    def consume_auto_recompute(self):
+        self._last_slider_change = 0.0
+
+    def set_status(self, text):
+        self._status_var.set(text)
+
+    def update(self):
+        try:
+            self.root.update()
+        except Exception:
+            self.flag_quit = True
+
+
+def params_key(params):
     return (
         params.use_icp,
         params.translation_only,
+        params.use_colored_icp,
         round(params.max_yaw_deg, 4),
         round(params.icp_threshold_m, 5),
         round(params.icp_voxel_m, 5),
@@ -739,7 +1027,7 @@ def params_key(params: TunerParams) -> tuple:
 # Main interactive loop
 # -----------------------------------------------------------------------------
 
-def run_tuner(run_dir: Path) -> None:
+def run_tuner(run_dir):
     dataset = load_cached_dataset(run_dir)
     tuned_dir = run_dir / "interactive_tuned_outputs"
     tuned_dir.mkdir(parents=True, exist_ok=True)
@@ -750,234 +1038,213 @@ def run_tuner(run_dir: Path) -> None:
     print(f"[RUN] {run_dir}")
     print(f"[OBJECT IDS] {dataset['object_ids']}")
     print("[KEYS] r recompute | v reset view | s save run output + auto config | b save best config | q/Esc quit")
-    print("[IMPORTANT] Slider changes and r DO NOT reset the view.")
+    print("[IMPORTANT] Slider changes do NOT reset the Open3D view. Only v / Reset View button resets it.")
 
-    setup_controls()
+    panel = MergeTunerControlPanel()
 
     vis = o3d.visualization.Visualizer()
-    vis.create_window(
-        window_name=VIEW_WINDOW,
-        width=1200,
-        height=800,
-        visible=True,
-    )
+    vis.create_window(window_name=VIEW_WINDOW, width=1200, height=800, visible=True)
 
-    render = vis.get_render_option()
-    render.background_color = np.array([0.02, 0.03, 0.04])
-    render.point_size = POINT_SIZE
-    render.show_coordinate_frame = True
-    render.mesh_show_back_face = True
+    render_opt = vis.get_render_option()
+    render_opt.background_color = np.array([0.02, 0.03, 0.04])
+    render_opt.point_size = POINT_SIZE
+    render_opt.show_coordinate_frame = True
+    render_opt.mesh_show_back_face = True
 
     floor_mesh = make_floor_mesh(dataset["floor_ref_local"])
     axis_gizmo = make_axis_gizmo(size=AXIS_SIZE_M)
+    grid_ls = _make_grid_lineset(dataset["floor_ref_local"])
+    axes_ls = _make_axes_lineset()
 
-    active_cloud: o3d.geometry.PointCloud | None = None
-    active_floor_added = False
-    active_axis_added = False
+    static_added = False
+    active_cloud = None
     view_initialized = False
 
-    last_key = None
-    last_params: TunerParams | None = None
-    last_debug: dict[str, Any] = {}
-    last_corner: o3d.geometry.PointCloud | None = None
-    last_icp: o3d.geometry.PointCloud | None = None
-
+    last_pk = None
+    last_params = None
+    last_debug = {}
+    last_corner = None
+    last_icp = None
+    last_per_obj_corner = []
+    last_per_obj_icp = []
     last_recompute_time = 0.0
 
-    def reset_view_to_top() -> None:
-        if active_cloud is None:
+    def reset_view_to_top():
+        if active_cloud is None or len(active_cloud.points) == 0:
             return
-
-        pts = np.asarray(active_cloud.points)
-        if len(pts) == 0:
-            return
-
         bbox = active_cloud.get_axis_aligned_bounding_box()
         center = bbox.get_center()
-
         ctr = vis.get_view_control()
         ctr.set_lookat(center)
         ctr.set_front(VIEW_FRONT)
         ctr.set_up(VIEW_UP)
         ctr.set_zoom(VIEW_ZOOM)
-
         vis.poll_events()
         vis.update_renderer()
 
-    def show_cloud(pcd: o3d.geometry.PointCloud) -> None:
-        nonlocal active_cloud, active_floor_added, active_axis_added, view_initialized
-
+    def show_cloud(pcd):
+        nonlocal active_cloud, static_added, view_initialized
         if active_cloud is not None:
             vis.remove_geometry(active_cloud, reset_bounding_box=False)
-
-        if not active_floor_added:
+        if not static_added:
             vis.add_geometry(floor_mesh, reset_bounding_box=False)
-            active_floor_added = True
-
-        if not active_axis_added:
+            vis.add_geometry(grid_ls, reset_bounding_box=False)
+            vis.add_geometry(axes_ls, reset_bounding_box=False)
             vis.add_geometry(axis_gizmo, reset_bounding_box=False)
-            active_axis_added = True
-
+            static_added = True
         active_cloud = o3d.geometry.PointCloud(pcd)
-
         pts = np.asarray(active_cloud.points)
-        print(f"[VIEW] showing {len(pts)} points")
-
-        if len(pts) > 0:
-            print(f"[VIEW] bbox min={pts.min(axis=0)} max={pts.max(axis=0)}")
-
-        # First render only: let Open3D establish scene bounds.
-        # After that: never touch the camera unless user presses v.
+        print(f"[VIEW] {len(pts)} points")
         first_render = not view_initialized
-
         vis.add_geometry(active_cloud, reset_bounding_box=first_render)
         vis.update_geometry(active_cloud)
         vis.update_geometry(floor_mesh)
+        vis.update_geometry(grid_ls)
+        vis.update_geometry(axes_ls)
         vis.update_geometry(axis_gizmo)
-
         if first_render and len(pts) > 0:
             reset_view_to_top()
             view_initialized = True
 
+    def do_recompute(p):
+        nonlocal last_corner, last_icp, last_per_obj_corner, last_per_obj_icp, last_debug
+        nonlocal last_params, last_pk, last_recompute_time
+        print(
+            f"[RECOMPUTE] view={'ICP' if p.view_mode_icp else 'corners'} "
+            f"icp={p.use_icp} colored={p.use_colored_icp} "
+            f"th={p.icp_threshold_m*1000:.1f}mm vox={p.icp_voxel_m*1000:.1f}mm "
+            f"yaw={p.max_yaw_deg:.1f}deg "
+            f"shift=({p.x_shift_m*1000:.1f},{p.y_shift_m*1000:.1f},{p.z_shift_m*1000:.1f})mm "
+            f"zscale={p.z_scale:.2f}"
+        )
+        last_corner, last_icp, last_per_obj_corner, last_per_obj_icp, last_debug = recompute_merge(dataset, p)
+        show_pcd = last_icp if p.view_mode_icp else last_corner
+        show_cloud(show_pcd)
+        last_params = p
+        last_pk = params_key(p)
+        last_recompute_time = time.time()
+        panel.set_status(
+            f"ICP thr={p.icp_threshold_m*1000:.0f}mm | vox={p.icp_voxel_m*1000:.0f}mm | "
+            f"yaw={p.max_yaw_deg:.0f}deg | z scale={p.z_scale*100:.0f}%"
+        )
+
+    def do_save(p):
+        if last_corner is None or last_icp is None:
+            print("[WARN] Nothing to save yet.")
+            panel.set_status("Nothing to save yet.")
+            return
+        corner_path = tuned_dir / "tuned_all_objects_corners_only.ply"
+        icp_path = tuned_dir / "tuned_all_objects_limited_icp.ply"
+        corner_scene = tuned_dir / "tuned_scene_corners_only_with_plane.ply"
+        icp_scene = tuned_dir / "tuned_scene_limited_icp_with_plane.ply"
+        debug_path = tuned_dir / "tuned_params_debug.json"
+        o3d.io.write_point_cloud(str(corner_path), last_corner)
+        o3d.io.write_point_cloud(str(icp_path), last_icp)
+        write_scene_with_floor_ply(corner_scene, dataset["floor_ref_local"], last_corner)
+        write_scene_with_floor_ply(icp_scene, dataset["floor_ref_local"], last_icp)
+        corner_metrics = [compute_object_height_metrics(np.asarray(pc.points), i) for i, pc in enumerate(last_per_obj_corner)]
+        icp_metrics = [compute_object_height_metrics(np.asarray(pc.points), i) for i, pc in enumerate(last_per_obj_icp)]
+        print_height_metrics_table("TUNED CORNERS ONLY", corner_metrics)
+        print_height_metrics_table("TUNED LIMITED ICP", icp_metrics)
+        save_height_metrics(tuned_dir, "tuned_object_height_metrics_corners_only", corner_metrics)
+        save_height_metrics(tuned_dir, "tuned_object_height_metrics_limited_icp", icp_metrics)
+        run_debug_payload = {
+            "params": p.__dict__,
+            "debug": last_debug,
+            "height_metrics": {"corners_only": corner_metrics, "limited_icp": icp_metrics},
+            "outputs": {"corners_only": str(corner_path), "limited_icp": str(icp_path),
+                        "scene_corners_only": str(corner_scene), "scene_limited_icp": str(icp_scene)},
+        }
+        save_json(debug_path, run_debug_payload)
+        _save_presentation_outputs(tuned_dir, "tuned_all_objects", last_icp)
+        ICP_MERGE_CONFIG_AUTO_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        auto_path = ICP_MERGE_CONFIG_AUTO_DIR / f"icp_merge_config_{ts}.json"
+        auto_payload = build_config_json(run_dir, p, last_debug)
+        auto_payload["height_metrics"] = {"corners_only": corner_metrics, "limited_icp": icp_metrics}
+        save_json(auto_path, auto_payload)
+        print("[SAVED]")
+        print(f"  {corner_scene}")
+        print(f"  {icp_scene}")
+        print(f"  {auto_path}")
+        panel.set_status(f"Saved: {ts}")
+
+    def do_save_best(p):
+        icp_metrics = [compute_object_height_metrics(np.asarray(pc.points), i) for i, pc in enumerate(last_per_obj_icp)]
+        ICP_MERGE_CONFIG_BEST_DIR.mkdir(parents=True, exist_ok=True)
+        best_path = ICP_MERGE_CONFIG_BEST_DIR / "tuned_params_debug.json"
+        best_payload = build_config_json(run_dir, p, last_debug)
+        best_payload["height_metrics"] = {"limited_icp": icp_metrics}
+        save_json(best_path, best_payload)
+        print(f"[BEST CONFIG SAVED] {best_path}")
+        panel.set_status(f"Best config saved: {best_path.name}")
+
     try:
         while True:
-            params = read_params()
-            key_tuple = params_key(params)
+            panel.update()
+            if panel.flag_quit:
+                break
+            p = panel.get_params()
+            pk = params_key(p)
             now = time.time()
-
-            should_recompute = last_key is None or key_tuple != last_key
-
-            if should_recompute and (now - last_recompute_time) > 0.25:
-                print(
-                    f"[RECOMPUTE] view={'ICP' if params.view_mode_icp else 'corners'} "
-                    f"use_icp={params.use_icp} "
-                    f"th={params.icp_threshold_m * 1000:.1f}mm "
-                    f"vox={params.icp_voxel_m * 1000:.1f}mm "
-                    f"yaw={params.max_yaw_deg:.1f}deg "
-                    f"shift=({params.x_shift_m * 1000:.1f},"
-                    f"{params.y_shift_m * 1000:.1f},"
-                    f"{params.z_shift_m * 1000:.1f})mm "
-                    f"zscale={params.z_scale:.2f}"
-                )
-
-                last_corner, last_icp, last_debug = recompute_merge(dataset, params)
-                show_pcd = last_icp if params.view_mode_icp else last_corner
-
-                show_cloud(show_pcd)
-
-                last_key = key_tuple
-                last_params = params
-                last_recompute_time = now
-
+            if panel.auto_recompute_due():
+                panel.consume_auto_recompute()
+                if pk != last_pk and (now - last_recompute_time) > 0.25:
+                    do_recompute(p)
+            if panel.flag_recompute:
+                panel.flag_recompute = False
+                do_recompute(p)
+            if panel.flag_reset_view:
+                panel.flag_reset_view = False
+                reset_view_to_top()
+            if panel.flag_save:
+                panel.flag_save = False
+                if last_params is not None:
+                    do_save(last_params)
+                else:
+                    print("[WARN] Recompute first.")
+                    panel.set_status("Recompute first.")
+            if panel.flag_save_best:
+                panel.flag_save_best = False
+                if last_params is not None:
+                    do_save_best(last_params)
+                else:
+                    print("[WARN] Recompute first.")
+                    panel.set_status("Recompute first.")
             vis.poll_events()
             vis.update_renderer()
-
-            key = cv2.waitKey(30) & 0xFF
-
+            key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
                 break
-
-            if key == ord("r"):
-                # Recompute only. View stays pinned.
-                last_key = None
-
-            if key == ord("v"):
-                # Explicit manual view reset.
+            elif key == ord("r"):
+                do_recompute(panel.get_params())
+            elif key == ord("v"):
                 reset_view_to_top()
-
-            if key == ord("s"):
-                if last_corner is None or last_icp is None or last_params is None:
-                    print("[WARN] Nothing to save yet.")
-                    continue
-
-                corner_path = tuned_dir / "tuned_all_objects_corners_only.ply"
-                icp_path = tuned_dir / "tuned_all_objects_limited_icp.ply"
-                corner_scene = tuned_dir / "tuned_scene_corners_only_with_plane.ply"
-                icp_scene = tuned_dir / "tuned_scene_limited_icp_with_plane.ply"
-                debug_path = tuned_dir / "tuned_params_debug.json"
-
-                o3d.io.write_point_cloud(str(corner_path), last_corner)
-                o3d.io.write_point_cloud(str(icp_path), last_icp)
-
-                write_scene_with_floor_ply(
-                    corner_scene,
-                    dataset["floor_ref_local"],
-                    last_corner,
-                )
-
-                write_scene_with_floor_ply(
-                    icp_scene,
-                    dataset["floor_ref_local"],
-                    last_icp,
-                )
-
-                run_debug_payload = {
-                    "params": last_params.__dict__,
-                    "debug": last_debug,
-                    "outputs": {
-                        "corners_only": str(corner_path),
-                        "limited_icp": str(icp_path),
-                        "scene_corners_only": str(corner_scene),
-                        "scene_limited_icp": str(icp_scene),
-                    },
-                }
-                save_json(debug_path, run_debug_payload)
-
-                # Also save a copy to the global auto config folder.
-                ICP_MERGE_CONFIG_AUTO_DIR.mkdir(parents=True, exist_ok=True)
-                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                auto_path = ICP_MERGE_CONFIG_AUTO_DIR / f"icp_merge_config_{ts}.json"
-                save_json(
-                    auto_path,
-                    build_config_json(run_dir, last_params, last_debug),
-                )
-
-                print("[SAVED]")
-                print(f"  {corner_scene}")
-                print(f"  {icp_scene}")
-                print(f"  {auto_path}")
-
-            if key == ord("b"):
-                if last_params is None:
-                    print("[WARN] Nothing to save yet.")
-                    continue
-
-                ICP_MERGE_CONFIG_BEST_DIR.mkdir(parents=True, exist_ok=True)
-                best_path = ICP_MERGE_CONFIG_BEST_DIR / "tuned_params_debug.json"
-                save_json(
-                    best_path,
-                    build_config_json(run_dir, last_params, last_debug),
-                )
-                print(f"[BEST CONFIG SAVED] {best_path}")
-
+            elif key == ord("s"):
+                if last_params is not None:
+                    do_save(last_params)
+            elif key == ord("b"):
+                if last_params is not None:
+                    do_save_best(last_params)
     finally:
         vis.destroy_window()
-        cv2.destroyWindow(CONTROL_WINDOW)
+        try:
+            panel.root.destroy()
+        except Exception:
+            pass
+        cv2.destroyAllWindows()
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args():
     parser = argparse.ArgumentParser(
         description="Interactive tuner for cached two-view reconstruction runs."
     )
-
-    parser.add_argument(
-        "--run-dir",
-        type=Path,
-        default=None,
-        help="Specific pipeline_YYYYMMDD_HHMMSS folder to tune.",
-    )
-
-    parser.add_argument(
-        "--root",
-        type=Path,
-        default=DEFAULT_OUTPUT_ROOT,
-        help="Root folder containing pipeline_* runs.",
-    )
-
+    parser.add_argument("--run-dir", type=Path, default=None)
+    parser.add_argument("--root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     return parser.parse_args()
 
 
-def main() -> None:
+def main():
     args = parse_args()
     run_dir = args.run_dir.resolve() if args.run_dir else latest_run_dir(args.root.resolve())
     run_tuner(run_dir)

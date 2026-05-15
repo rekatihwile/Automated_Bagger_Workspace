@@ -29,42 +29,30 @@ CAMERA_INDEX = 1
 # Windows usually behaves best with DirectShow for UVC camera controls.
 CAMERA_BACKEND = "DSHOW"
 CAMERA_FOURCC = "MJPG"
-CAMERA_FPS = 30
+CAMERA_FPS = 10
 
-# Requested stitched-stereo stream size. If the driver falls back to a mono mode,
-# `capture_pairs.py` will refuse to split and will tell you what it returned.
-STREAM_WIDTH = 1280
-STREAM_HEIGHT = 480
+0
 
 # Modes worth probing with camera_scan.py. Keep these explicit because some
 # drivers do not honor scaled requests and silently fall back to mono modes.
 STEREO_STREAM_MODES = (
-  
     
-    # --- 540p / 600p Base Heights ---
-    (2134, 600), (1920, 600), (1600, 600), (1500, 600),
-    (1920, 540), (1728, 540), (1440, 540), (1350, 540),
-    
-    # --- 480p Base Heights (Very common for UVC fallbacks) ---
-    (1708, 480), (1706, 480), (1536, 480), (1280, 480), (1200, 480),
-    
-    # --- 360p / 400p Base Heights ---
-    (1422, 400), (1280, 400), (1066, 400), (1000, 400),
-    (1280, 360), (1152, 360), (960, 360), (900, 360),
-    
-    # --- 240p / 300p Base Heights ---
-    (1066, 300), (960, 300), (800, 300), (750, 300),
-    (854, 240), (768, 240), (640, 240), (600, 240),
-    
-    # --- 180p / 270p Base Heights (Extreme high-framerate crops) ---
-    (960, 270), (864, 270), (720, 270), (676, 270),
-    (640, 180), (576, 180), (480, 180), (450, 180), (448, 180),
-
-    # --- Common UVC Quirks & 16-Pixel Alignments ---
-    (2560, 712), (1280, 712), (1920, 1072), (1280, 472), (640, 472),
-    
+  (3840,1080),  # 2x 1920x1080 (16:9) - ratio 3.56
+  (2688,1520),  # 2x 1344x760 (4:3) - ratio 2.67
+  (2560,720),   # 2x 1280x720 (16:9) - ratio 3.56
   
 )
+MODE = 1  # index into the above tuple for the requested stereo stream mode. If the driver does not support it, capture_pairs.py will tell you what it returned.
+
+
+MODE_INDEX = STEREO_STREAM_MODES[MODE-1]
+
+
+# Requested stitched-stereo stream size. If the driver falls back to a mono mode,
+# `capture_pairs.py` will refuse to split and will tell you what it returned.
+STREAM_WIDTH, STREAM_HEIGHT =  MODE_INDEX[0], MODE_INDEX[1]
+
+
 # Preview-only scale for the display window. Saved images are not resized.
 DISPLAY_SCALE = 1
 
@@ -158,15 +146,18 @@ LIVE_BOARD_DETECTION = False
 CAMERA_IDS_PATH = PROJECT_ROOT / "camera_ids.json"
 CAMERA_SETTINGS_PATH = PROJECT_ROOT / "camera_settings.json"
 
+# Root directory that holds all stereo pair session folders (e.g. pair_0001, pair_0002 …).
+# calibrate.py scans every pair_* subfolder here automatically.
 STEREO_PAIR_DIR = CALIBRATION_ROOT / "pairs"
 MATRIX_ROOT = CALIBRATION_ROOT / "matrices"
 
-# Name of the folder (inside PROJECT_ROOT) where captured stereo pairs are saved.
-# Files will be saved as left_00000.png / right_00000.png directly inside this folder.
-CAPTURE_SESSION_FOLDER = "YOLO_Bandaid"
-CAPTURE_SESSION_DIR = PROJECT_ROOT / CAPTURE_SESSION_FOLDER
-CAPTURE_LEFT_DIR = CAPTURE_SESSION_DIR / "left"
-CAPTURE_RIGHT_DIR = CAPTURE_SESSION_DIR / "right"
+# Name of the session subfolder inside STEREO_PAIR_DIR where capture_pairs.py saves images.
+# Change this to start a fresh capture session without overwriting old data.
+# calibrate.py will discover the new folder automatically on next run.
+CAPTURE_SESSION_NAME = "pair_0017"
+CAPTURE_SESSION_DIR = STEREO_PAIR_DIR / CAPTURE_SESSION_NAME
+
+# Calibration matrix output — downstream scripts (rectify, disparity, etc.) read from here.
 ACTIVE_MATRIX_DIR = MATRIX_ROOT / "latest"
 ACTIVE_CALIBRATION_NPZ = ACTIVE_MATRIX_DIR / "stereo_calibration.npz"
 ACTIVE_CALIBRATION_JSON = ACTIVE_MATRIX_DIR / "calibration_summary.json"
@@ -176,8 +167,7 @@ def ensure_directories() -> None:
     """Create project output directories used by the capture/calibration scripts."""
     STEREO_PAIR_DIR.mkdir(parents=True, exist_ok=True)
     ACTIVE_MATRIX_DIR.mkdir(parents=True, exist_ok=True)
-    CAPTURE_LEFT_DIR.mkdir(parents=True, exist_ok=True)
-    CAPTURE_RIGHT_DIR.mkdir(parents=True, exist_ok=True)
+    CAPTURE_SESSION_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _load_json(path: Path, default: Any) -> Any:

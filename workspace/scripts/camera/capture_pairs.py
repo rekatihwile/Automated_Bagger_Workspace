@@ -27,7 +27,7 @@ WINDOW_NAME = "Stereo Pair Capture"
 
 def next_pair_index() -> int:
     indices: list[int] = []
-    for path in config.CAPTURE_LEFT_DIR.glob("left_*.png"):
+    for path in config.CAPTURE_SESSION_DIR.glob("left_*.png"):
         try:
             indices.append(int(path.stem.split("_", 1)[1]))
         except ValueError:
@@ -36,8 +36,8 @@ def next_pair_index() -> int:
 
 
 def delete_pair(pair_index: int) -> None:
-    for side_dir, side in ((config.CAPTURE_LEFT_DIR, "left"), (config.CAPTURE_RIGHT_DIR, "right")):
-        f = side_dir / f"{side}_{pair_index:05d}.png"
+    for side in ("left", "right"):
+        f = config.CAPTURE_SESSION_DIR / f"{side}_{pair_index:05d}.png"
         if f.exists():
             f.unlink()
 
@@ -50,8 +50,8 @@ def detect_checkerboard(frame) -> bool:
 
 
 def save_pair(pair_index: int, left, right, stereo: StereoCamera) -> tuple[Path, Path]:
-    left_path = config.CAPTURE_LEFT_DIR / f"left_{pair_index:05d}.png"
-    right_path = config.CAPTURE_RIGHT_DIR / f"right_{pair_index:05d}.png"
+    left_path = config.CAPTURE_SESSION_DIR / f"left_{pair_index:05d}.png"
+    right_path = config.CAPTURE_SESSION_DIR / f"right_{pair_index:05d}.png"
     cv2.imwrite(str(left_path), left)
     cv2.imwrite(str(right_path), right)
     return left_path, right_path
@@ -80,7 +80,7 @@ def main() -> None:
             return
 
         print(f"Saved eye size:   {eye.width}x{eye.height}")
-        print(f"Saving pairs to:  {config.CAPTURE_SESSION_DIR} (left/ + right/)")
+        print(f"Saving pairs to:  {config.CAPTURE_SESSION_DIR}")
         print("Enter/Space=capture  D=delete last  Q/Esc=quit")
 
         while True:

@@ -4,6 +4,7 @@ Calibrate the HBVCAM stereo pair and save triangulation-ready matrices.
 
 from __future__ import annotations
 
+import argparse
 import json
 from datetime import datetime
 from pathlib import Path
@@ -81,6 +82,18 @@ def load_pairs(pair_dir: Path) -> list[tuple[str, Path, Path]]:
 
     if folder_pairs:
         return folder_pairs
+
+    # Loader for pair_* folders that contain left_NNNNN.png / right_NNNNN.png files.
+    multi_pairs: list[tuple[str, Path, Path]] = []
+    for pair_path in sorted(pair_dir.glob("pair_*")):
+        lefts = sorted(pair_path.glob("left_*.png"))
+        for left in lefts:
+            index = left.stem.split("_", 1)[1]
+            right = pair_path / f"right_{index}.png"
+            if right.exists():
+                multi_pairs.append((f"{pair_path.name}_{index}", left, right))
+    if multi_pairs:
+        return multi_pairs
 
     # Backward-compatible loader for old left_0000.png/right_0000.png datasets.
     flat_pairs: list[tuple[str, Path, Path]] = []
@@ -230,8 +243,8 @@ def calibrate(objpoints, left_points, right_points, image_size: tuple[int, int])
     }
 
 
-def save_matrix_set(results: dict[str, np.ndarray], used_pairs: list[str]) -> None:
-    out_dir = config.ACTIVE_MATRIX_DIR
+def save_matrix_set(results: dict[str, np.ndarray], used_pairs: list[str], out_dir: Path | None = None) -> None:
+    out_dir = out_dir if out_dir is not None else config.ACTIVE_MATRIX_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
 
     np.savez(out_dir / "stereo_calibration.npz", **results)
@@ -274,16 +287,30 @@ def save_matrix_set(results: dict[str, np.ndarray], used_pairs: list[str]) -> No
         "matrix_files": [f"{name}.csv" for name in matrix_names],
         "npz_file": "stereo_calibration.npz",
     }
-    with config.ACTIVE_CALIBRATION_JSON.open("w", encoding="utf-8") as f:
+    with (out_dir / "calibration_summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
         f.write("\n")
 
 
 def main() -> None:
-    config.ensure_directories()
-    pairs = load_pairs(config.STEREO_PAIR_DIR)
+    parser = argparse.ArgumentParser(description="Stereo calibration")
+    parser.add_argument("--pairs", type=Path, default=None,
+                        help="Directory of stereo pairs (default: config.STEREO_PAIR_DIR)")
+    parser.add_argument("--output", type=Path, default=None,
+                        help="Output directory for matrices (default: config.ACTIVE_MATRIX_DIR)")
+    args = parser.parse_args()
+
+    pair_dir: Path = args.pairs if args.pairs is not None else config.STEREO_PAIR_DIR
+    out_dir: Path | None = args.output
+
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        config.ensure_directories()
+
+    pairs = load_pairs(pair_dir)
     if not pairs:
-        print(f"No stereo pairs found in {config.STEREO_PAIR_DIR}")
+        print(f"No stereo pairs found in {pair_dir}")
         print("Run python capture_pairs.py first.")
         return
 
@@ -298,10 +325,11 @@ def main() -> None:
     print(f"\nCalibrating with {len(objpoints)} pair(s) at {image_size[0]}x{image_size[1]}...")
     results = calibrate(objpoints, left_points, right_points, image_size)
     print_results(results)
-    save_matrix_set(results, used_pairs)
+    save_matrix_set(results, used_pairs, out_dir)
 
+    effective_out = out_dir if out_dir is not None else config.ACTIVE_MATRIX_DIR
     print("\nCalibration saved.")
-    print(f"  Folder:       {config.ACTIVE_MATRIX_DIR}")
+    print(f"  Folder:       {effective_out}")
     print(f"  RMS stereo:   {float(results['rms_stereo'][0]):.6f} px")
     print(f"  Baseline:     {float(results['baseline_mm'][0]):.3f} mm")
     print("  Config var:   config.STEREO_CALIBRATION")

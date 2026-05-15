@@ -417,8 +417,8 @@ def main() -> None:
 
     parser.add_argument("--image", type=Path, default=None, help="Single image to segment.")
     parser.add_argument("--index", type=int, default=0, help="Stereo pair index from capture folders.")
-    parser.add_argument("--left-dir", type=Path, default=config.CAPTURE_LEFT_DIR)
-    parser.add_argument("--right-dir", type=Path, default=config.CAPTURE_RIGHT_DIR)
+    parser.add_argument("--left-dir", type=Path, default=config.CAPTURE_SESSION_DIR)
+    parser.add_argument("--right-dir", type=Path, default=config.CAPTURE_SESSION_DIR)
     parser.add_argument("--rectify", action="store_true", help="Rectify left image before SAM.")
     parser.add_argument("--checkpoint", type=Path, required=True, help="SAM checkpoint .pth file.")
     parser.add_argument(

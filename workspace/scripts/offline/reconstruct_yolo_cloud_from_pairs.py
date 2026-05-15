@@ -480,13 +480,13 @@ def main() -> None:
     parser.add_argument(
         "--left-dir",
         type=Path,
-        default=config.CAPTURE_LEFT_DIR,
+        default=config.CAPTURE_SESSION_DIR,
         help="Folder containing left_XXXXX images.",
     )
     parser.add_argument(
         "--right-dir",
         type=Path,
-        default=config.CAPTURE_RIGHT_DIR,
+        default=config.CAPTURE_SESSION_DIR,
         help="Folder containing right_XXXXX images.",
     )
     parser.add_argument(

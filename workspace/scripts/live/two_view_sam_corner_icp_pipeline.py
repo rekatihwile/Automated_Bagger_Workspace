@@ -63,7 +63,7 @@ ACTIVE_TUNER = True  # Whether to launch the interactive merge tuner after savin
 MARKER_IDS_CW: list[int] = [0, 1, 3, 2]  # TL, TR, BR, BL
 ARUCO_DICT_TYPE: int = cv2.aruco.DICT_ARUCO_ORIGINAL
 
-NUM_VIEWS = 2
+NUM_VIEWS = 1
 TARGET_OBJECT_COUNT = 6
 
 RAFT_ITERS = 32
@@ -87,7 +87,7 @@ SCALE_TO_METERS = 0.001
 MAX_OBJECT_POINTS = 100_000
 VOXEL_SIZE_OBJECT_M = 0.0025
 
-WARP_MODE = "similarity_3d"  # "homography_plane" or "similarity_3d"
+WARP_MODE = "homography_plane"  # "homography_plane" or "similarity_3d"
 Z_SCALE_MODE = "average_xy"     # "average_xy" or "none"
 GLOBAL_FINAL_SHIFT_M = np.array([0.0, 0.0, 0.0], dtype=np.float64)
 
@@ -112,12 +112,46 @@ FINAL_OUTLIER_NB_NEIGHBORS = 25
 FINAL_OUTLIER_STD_RATIO = 2.0
 
 TUNED_Z_SCALE = 1.0  # Applied to source z-axis before final shift; overridden by loaded ICP config.
+USE_COLORED_ICP = False  # Experimental: use colored ICP (requires normals); overridden by loaded config.
 
 USE_ICP_MERGE_CONFIG = True   # If True, load ICP merge config from file when available.
 PREFER_BEST_ICP_CONFIG = True  # If True, prefer config_best/ over latest auto/ config.
 ICP_MERGE_CONFIG_ROOT = OUTPUT_ROOT / "ICP_merge_config"
 ICP_MERGE_CONFIG_AUTO_DIR = ICP_MERGE_CONFIG_ROOT / "auto"
 ICP_MERGE_CONFIG_BEST_PATH = ICP_MERGE_CONFIG_ROOT / "config_best" / "tuned_params_debug.json"
+
+# --- Workspace grid / coordinate plane outputs ---
+ENABLE_WORKSPACE_GRID_OUTPUT = True
+WORKSPACE_GRID_SPACING_M = 0.05
+WORKSPACE_GRID_LINE_RADIUS_M = 0.001
+WORKSPACE_AXIS_LENGTH_M = 0.15
+WORKSPACE_LABEL_POINTS = True
+
+# --- Per-object height metrics ---
+ENABLE_OBJECT_HEIGHT_METRICS = True
+HEIGHT_LOW_PERCENTILE = 2.0
+HEIGHT_HIGH_PERCENTILE = 95.0
+HEIGHT_TOP_PERCENTILE = 95.0
+HEIGHT_BOTTOM_PERCENTILE = 5.0
+HEIGHT_MIN_POINTS = 50
+
+# --- Presentation / mesh outputs ---
+ENABLE_PRESENTATION_MESH_OUTPUTS = True
+ENABLE_RADIUS_OUTLIER_REMOVAL = True
+RADIUS_OUTLIER_NB_POINTS = 8
+RADIUS_OUTLIER_RADIUS_M = 0.01
+ENABLE_NORMAL_ESTIMATION = True
+NORMAL_RADIUS_M = 0.015
+NORMAL_MAX_NN = 30
+ENABLE_MESH_BALL_PIVOTING = True
+BALL_PIVOT_RADII_M = [0.004, 0.008, 0.012]
+ENABLE_MESH_SMOOTHING = True
+MESH_SMOOTHING_ITERATIONS = 3
+
+# --- Known geometry validation ---
+KNOWN_GEOMETRY_VALIDATION = False
+KNOWN_OBJECT_ID = 0
+KNOWN_OBJECT_DIMS_M = {"x": 0.050, "y": 0.050, "z": 0.050}
 
 SAVE_CAPTURE_IMAGES = True
 SAVE_MASK_OVERLAYS = True
@@ -736,16 +770,41 @@ def run_limited_icp(source, reference):
     ref_down = reference.voxel_down_sample(ICP_VOXEL_SIZE)
     if source_down.is_empty() or ref_down.is_empty():
         return source, {"used": False, "reason": "empty_downsample"}
-    if ICP_METHOD == "point_to_plane":
-        source_down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=max(ICP_VOXEL_SIZE * 3, 0.005), max_nn=30))
-        ref_down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=max(ICP_VOXEL_SIZE * 3, 0.005), max_nn=30))
-        estimation = o3d.pipelines.registration.TransformationEstimationPointToPlane()
+
+    # Colored ICP path
+    if USE_COLORED_ICP:
+        try:
+            source_down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=max(ICP_VOXEL_SIZE * 3, 0.005), max_nn=30))
+            ref_down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=max(ICP_VOXEL_SIZE * 3, 0.005), max_nn=30))
+            result = o3d.pipelines.registration.registration_colored_icp(
+                source_down, ref_down, ICP_DISTANCE_THRESHOLD, np.eye(4),
+                o3d.pipelines.registration.TransformationEstimationForColoredICP(),
+                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=80, relative_fitness=1e-7, relative_rmse=1e-7),
+            )
+            method_used = "colored_icp"
+        except Exception as exc:
+            print(f"[WARN] Colored ICP failed ({exc}), falling back to point-to-point.")
+            USE_COLORED_ICP_fallback = True
+            result = None
+        else:
+            USE_COLORED_ICP_fallback = False
     else:
-        estimation = o3d.pipelines.registration.TransformationEstimationPointToPoint(with_scaling=ALLOW_SCALE_IN_ICP)
-    result = o3d.pipelines.registration.registration_icp(
-        source_down, ref_down, ICP_DISTANCE_THRESHOLD, np.eye(4), estimation,
-        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=80, relative_fitness=1e-7, relative_rmse=1e-7),
-    )
+        USE_COLORED_ICP_fallback = True
+        result = None
+
+    if USE_COLORED_ICP_fallback or result is None:
+        if ICP_METHOD == "point_to_plane":
+            source_down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=max(ICP_VOXEL_SIZE * 3, 0.005), max_nn=30))
+            ref_down.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=max(ICP_VOXEL_SIZE * 3, 0.005), max_nn=30))
+            estimation = o3d.pipelines.registration.TransformationEstimationPointToPlane()
+        else:
+            estimation = o3d.pipelines.registration.TransformationEstimationPointToPoint(with_scaling=ALLOW_SCALE_IN_ICP)
+        result = o3d.pipelines.registration.registration_icp(
+            source_down, ref_down, ICP_DISTANCE_THRESHOLD, np.eye(4), estimation,
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=80, relative_fitness=1e-7, relative_rmse=1e-7),
+        )
+        method_used = ICP_METHOD
+
     T = result.transformation.copy()
     if ICP_ONLY_TRANSLATION:
         T2 = np.eye(4)
@@ -756,12 +815,278 @@ def run_limited_icp(source, reference):
     trans = float(np.linalg.norm(T[:3, 3]))
     rot = float(np.rad2deg(rotation_angle_from_matrix(T[:3, :3])))
     if REJECT_BAD_ICP and (result.fitness < MIN_ACCEPTABLE_ICP_FITNESS or result.inlier_rmse > MAX_ACCEPTABLE_ICP_RMSE or trans > MAX_ICP_TRANSLATION_M or rot > MAX_ICP_TOTAL_ROTATION_DEG):
-        print(f"[ICP REJECTED] fitness={result.fitness:.4f} rmse={result.inlier_rmse:.4f} trans={trans:.4f} rot={rot:.2f}")
-        return source, {"used": True, "accepted": False, "fitness": float(result.fitness), "rmse": float(result.inlier_rmse)}
+        print(f"[ICP REJECTED] method={method_used} fitness={result.fitness:.4f} rmse={result.inlier_rmse:.4f} trans={trans:.4f} rot={rot:.2f}")
+        return source, {"used": True, "accepted": False, "method": method_used, "fitness": float(result.fitness), "rmse": float(result.inlier_rmse)}
     aligned = copy.deepcopy(source)
     aligned.transform(T)
-    print(f"[ICP] accepted fitness={result.fitness:.4f} rmse={result.inlier_rmse:.4f} trans={trans:.4f} rot={rot:.2f}")
-    return aligned, {"used": True, "accepted": True, "fitness": float(result.fitness), "rmse": float(result.inlier_rmse), "transform": T.tolist()}
+    print(f"[ICP] method={method_used} accepted fitness={result.fitness:.4f} rmse={result.inlier_rmse:.4f} trans={trans:.4f} rot={rot:.2f}")
+    return aligned, {"used": True, "accepted": True, "method": method_used, "fitness": float(result.fitness), "rmse": float(result.inlier_rmse), "transform": T.tolist()}
+
+# =============================================================================
+# WORKSPACE GRID / AXES
+# =============================================================================
+
+def get_workspace_bounds_from_floor(floor_corners_local: np.ndarray) -> dict:
+    pts = np.asarray(floor_corners_local, dtype=np.float64)
+    return {
+        "x_min": float(pts[:, 0].min()),
+        "x_max": float(pts[:, 0].max()),
+        "y_min": float(pts[:, 1].min()),
+        "y_max": float(pts[:, 1].max()),
+        "z_floor": float(np.median(pts[:, 2])),
+    }
+
+
+def make_workspace_grid_lines(floor_corners_local: np.ndarray, spacing_m: float) -> "Any":
+    import open3d as o3d
+    import math
+    bounds = get_workspace_bounds_from_floor(floor_corners_local)
+    z = bounds["z_floor"]
+    x0, x1 = bounds["x_min"], bounds["x_max"]
+    y0, y1 = bounds["y_min"], bounds["y_max"]
+
+    points: list[list[float]] = []
+    lines_list: list[list[int]] = []
+    colors: list[list[float]] = []
+
+    def add_line(p1: list[float], p2: list[float], color: list[float]) -> None:
+        idx = len(points)
+        points.append(p1)
+        points.append(p2)
+        lines_list.append([idx, idx + 1])
+        colors.append(color)
+
+    grid_color = [0.55, 0.58, 0.62]
+    border_color = [0.9, 0.9, 0.4]
+
+    xs = np.arange(math.ceil(x0 / spacing_m) * spacing_m, x1 + spacing_m * 0.01, spacing_m)
+    for x in xs:
+        add_line([float(x), y0, z], [float(x), y1, z], grid_color)
+
+    ys = np.arange(math.ceil(y0 / spacing_m) * spacing_m, y1 + spacing_m * 0.01, spacing_m)
+    for y in ys:
+        add_line([x0, float(y), z], [x1, float(y), z], grid_color)
+
+    corners_xy = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+    for i in range(4):
+        a, b = corners_xy[i], corners_xy[(i + 1) % 4]
+        add_line([a[0], a[1], z], [b[0], b[1], z], border_color)
+
+    ls = o3d.geometry.LineSet()
+    ls.points = o3d.utility.Vector3dVector(points)
+    ls.lines = o3d.utility.Vector2iVector(lines_list)
+    ls.colors = o3d.utility.Vector3dVector(colors)
+    return ls
+
+
+def make_workspace_axes(axis_length_m: float) -> "Any":
+    import open3d as o3d
+    points = [
+        [0.0, 0.0, 0.0], [axis_length_m, 0.0, 0.0],
+        [0.0, 0.0, 0.0], [0.0, axis_length_m, 0.0],
+        [0.0, 0.0, 0.0], [0.0, 0.0, axis_length_m],
+    ]
+    lines_idx = [[0, 1], [2, 3], [4, 5]]
+    line_colors = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    ls = o3d.geometry.LineSet()
+    ls.points = o3d.utility.Vector3dVector(points)
+    ls.lines = o3d.utility.Vector2iVector(lines_idx)
+    ls.colors = o3d.utility.Vector3dVector(line_colors)
+    return ls
+
+
+def _sample_lineset_to_points(ls: "Any", step_m: float) -> "tuple[np.ndarray, np.ndarray]":
+    pts_arr = np.asarray(ls.points, dtype=np.float64)
+    lines_arr = np.asarray(ls.lines)
+    cols_arr = np.asarray(ls.colors)
+    sampled_pts: list[np.ndarray] = []
+    sampled_cols: list[np.ndarray] = []
+    for i, (a_idx, b_idx) in enumerate(lines_arr):
+        a, b = pts_arr[a_idx], pts_arr[b_idx]
+        dist = float(np.linalg.norm(b - a))
+        n_samples = max(2, int(dist / step_m) + 1)
+        ts = np.linspace(0.0, 1.0, n_samples)
+        for t in ts:
+            sampled_pts.append(a + t * (b - a))
+            sampled_cols.append(cols_arr[i])
+    return np.vstack(sampled_pts), np.clip(np.vstack(sampled_cols) * 255, 0, 255).astype(np.uint8)
+
+
+def save_workspace_grid_and_axes_ply(run_dir: Path, floor_corners_local: np.ndarray) -> None:
+    grid_ls = make_workspace_grid_lines(floor_corners_local, WORKSPACE_GRID_SPACING_M)
+    grid_pts, grid_cols = _sample_lineset_to_points(grid_ls, WORKSPACE_GRID_LINE_RADIUS_M)
+    _write_simple_point_ply(run_dir / "workspace_grid_lines.ply", grid_pts, grid_cols)
+
+    ax_ls = make_workspace_axes(WORKSPACE_AXIS_LENGTH_M)
+    ax_pts, ax_cols = _sample_lineset_to_points(ax_ls, WORKSPACE_GRID_LINE_RADIUS_M)
+    _write_simple_point_ply(run_dir / "workspace_axes.ply", ax_pts, ax_cols)
+
+    print(f"[SAVE] workspace_grid_lines.ply + workspace_axes.ply -> {run_dir}")
+
+
+def _write_simple_point_ply(path: Path, xyz: np.ndarray, rgb: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        f.write("ply\nformat ascii 1.0\n")
+        f.write(f"element vertex {len(xyz)}\n")
+        f.write("property float x\nproperty float y\nproperty float z\n")
+        f.write("property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n")
+        for p, c in zip(xyz, rgb):
+            f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f} {int(c[0])} {int(c[1])} {int(c[2])}\n")
+
+# =============================================================================
+# PER-OBJECT HEIGHT METRICS
+# =============================================================================
+
+def compute_object_height_metrics(points_local: np.ndarray, object_id: int) -> dict:
+    pts = np.asarray(points_local, dtype=np.float64)
+    n = len(pts)
+    if n < HEIGHT_MIN_POINTS:
+        return {"object_id": object_id, "valid": False, "point_count": n}
+    z = pts[:, 2]
+    centroid = pts.mean(axis=0)
+    bbox_min = pts.min(axis=0)
+    bbox_max = pts.max(axis=0)
+    dims = bbox_max - bbox_min
+    z_low = float(np.percentile(z, HEIGHT_LOW_PERCENTILE))
+    z_high = float(np.percentile(z, HEIGHT_HIGH_PERCENTILE))
+    z_top = float(np.percentile(z, HEIGHT_TOP_PERCENTILE))
+    z_bottom = float(np.percentile(z, HEIGHT_BOTTOM_PERCENTILE))
+    robust_h = z_high - z_low
+    top_h = z_top
+    return {
+        "object_id": object_id,
+        "valid": True,
+        "point_count": n,
+        "centroid_x_m": float(centroid[0]),
+        "centroid_y_m": float(centroid[1]),
+        "centroid_z_m": float(centroid[2]),
+        "bbox_x_min_m": float(bbox_min[0]),
+        "bbox_x_max_m": float(bbox_max[0]),
+        "bbox_y_min_m": float(bbox_min[1]),
+        "bbox_y_max_m": float(bbox_max[1]),
+        "bbox_z_min_m": float(bbox_min[2]),
+        "bbox_z_max_m": float(bbox_max[2]),
+        "bbox_width_x_m": float(dims[0]),
+        "bbox_depth_y_m": float(dims[1]),
+        "bbox_height_z_raw_m": float(dims[2]),
+        "z_low_percentile_m": z_low,
+        "z_high_percentile_m": z_high,
+        "robust_height_m": robust_h,
+        "robust_height_cm": robust_h * 100.0,
+        "floor_relative_top_height_m": top_h,
+        "floor_relative_top_height_cm": top_h * 100.0,
+        "floor_relative_top_height_mm": top_h * 1000.0,
+        "floor_relative_bottom_m": z_bottom,
+    }
+
+
+def print_height_metrics_table(label: str, metrics: list) -> None:
+    print(f"\n[HEIGHT METRICS - {label}]")
+    print(f"{'obj':>4} | {'pts':>6} | {'cx_cm':>6} | {'cy_cm':>6} | {'top_cm':>7} | {'robust_cm':>9} | {'bbox_x_cm':>9} | {'bbox_y_cm':>9}")
+    print("-" * 75)
+    for m in metrics:
+        if not m.get("valid"):
+            print(f"{m['object_id']:>4} | INVALID (pts={m['point_count']})")
+            continue
+        print(
+            f"{m['object_id']:>4} | {m['point_count']:>6} | "
+            f"{m['centroid_x_m']*100:>6.1f} | {m['centroid_y_m']*100:>6.1f} | "
+            f"{m['floor_relative_top_height_cm']:>7.2f} | {m['robust_height_cm']:>9.2f} | "
+            f"{m['bbox_width_x_m']*100:>9.2f} | {m['bbox_depth_y_m']*100:>9.2f}"
+        )
+
+
+def save_height_metrics(run_dir: Path, prefix: str, metrics: list) -> None:
+    import csv
+    json_path = run_dir / f"{prefix}.json"
+    csv_path = run_dir / f"{prefix}.csv"
+    json_path.write_text(json.dumps(metrics, indent=2) + "\n", encoding="utf-8")
+    if not metrics:
+        return
+    keys = list(metrics[0].keys())
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(metrics)
+    print(f"[SAVE] {csv_path}")
+
+# =============================================================================
+# PRESENTATION MESH OUTPUTS
+# =============================================================================
+
+def clean_cloud_for_presentation(pcd: "Any") -> "Any":
+    import open3d as o3d
+    out = pcd
+    if ENABLE_RADIUS_OUTLIER_REMOVAL and len(out.points) >= RADIUS_OUTLIER_NB_POINTS:
+        out, _ = out.remove_radius_outlier(nb_points=RADIUS_OUTLIER_NB_POINTS, radius=RADIUS_OUTLIER_RADIUS_M)
+    if len(out.points) > 0 and VOXEL_SIZE_FINAL_PER_OBJECT > 0:
+        out = out.voxel_down_sample(VOXEL_SIZE_FINAL_PER_OBJECT)
+    if ENABLE_NORMAL_ESTIMATION and len(out.points) > 0:
+        out.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=NORMAL_RADIUS_M, max_nn=NORMAL_MAX_NN))
+        out.orient_normals_consistent_tangent_plane(30)
+    return out
+
+
+def make_ball_pivot_mesh(pcd: "Any") -> "Any | None":
+    import open3d as o3d
+    try:
+        if not pcd.has_normals():
+            pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=NORMAL_RADIUS_M, max_nn=NORMAL_MAX_NN))
+            pcd.orient_normals_consistent_tangent_plane(30)
+        radii = o3d.utility.DoubleVector(BALL_PIVOT_RADII_M)
+        mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(pcd, radii)
+        if ENABLE_MESH_SMOOTHING and len(mesh.triangles) > 0:
+            mesh = mesh.filter_smooth_taubin(number_of_iterations=MESH_SMOOTHING_ITERATIONS)
+        mesh.compute_vertex_normals()
+        return mesh
+    except Exception as exc:
+        print(f"[WARN] Ball-pivot meshing failed: {exc}")
+        return None
+
+
+def save_presentation_outputs(output_dir: Path, prefix: str, pcd: "Any") -> None:
+    import open3d as o3d
+    if not ENABLE_PRESENTATION_MESH_OUTPUTS:
+        return
+    try:
+        clean = clean_cloud_for_presentation(pcd)
+        o3d.io.write_point_cloud(str(output_dir / f"{prefix}_cleaned_cloud.ply"), clean)
+        print(f"[SAVE] {prefix}_cleaned_cloud.ply")
+    except Exception as exc:
+        print(f"[WARN] Presentation clean cloud failed: {exc}")
+        return
+    if ENABLE_MESH_BALL_PIVOTING:
+        try:
+            mesh = make_ball_pivot_mesh(clean)
+            if mesh is not None and len(mesh.triangles) > 0:
+                o3d.io.write_triangle_mesh(str(output_dir / f"{prefix}_mesh_ball_pivot.ply"), mesh)
+                print(f"[SAVE] {prefix}_mesh_ball_pivot.ply")
+                if ENABLE_MESH_SMOOTHING:
+                    smoothed = mesh.filter_smooth_simple(number_of_iterations=MESH_SMOOTHING_ITERATIONS)
+                    smoothed.compute_vertex_normals()
+                    o3d.io.write_triangle_mesh(str(output_dir / f"{prefix}_mesh_smoothed.ply"), smoothed)
+                    print(f"[SAVE] {prefix}_mesh_smoothed.ply")
+        except Exception as exc:
+            print(f"[WARN] Presentation mesh failed: {exc}")
+
+# =============================================================================
+# KNOWN GEOMETRY VALIDATION
+# =============================================================================
+
+def compute_cloud_bbox_metrics(pcd: "Any") -> dict:
+    pts = np.asarray(pcd.points, dtype=np.float64)
+    if len(pts) == 0:
+        return {"valid": False}
+    mn, mx = pts.min(axis=0), pts.max(axis=0)
+    dims = mx - mn
+    return {
+        "valid": True,
+        "bbox_min": mn.tolist(),
+        "bbox_max": mx.tolist(),
+        "dims_m": dims.tolist(),
+        "centroid": pts.mean(axis=0).tolist(),
+    }
 
 # =============================================================================
 # ICP MERGE CONFIG LOAD / APPLY
@@ -811,10 +1136,11 @@ def apply_icp_merge_config(params: dict) -> None:
     global RUN_LIMITED_ICP, ICP_ONLY_TRANSLATION, MAX_ICP_Z_ROTATION_DEG
     global ICP_DISTANCE_THRESHOLD, ICP_VOXEL_SIZE
     global VOXEL_SIZE_FINAL_PER_OBJECT, VOXEL_SIZE_FINAL_ALL_OBJECTS
-    global GLOBAL_FINAL_SHIFT_M, TUNED_Z_SCALE
+    global GLOBAL_FINAL_SHIFT_M, TUNED_Z_SCALE, USE_COLORED_ICP
 
     RUN_LIMITED_ICP = bool(params["use_icp"])
     ICP_ONLY_TRANSLATION = bool(params["translation_only"])
+    USE_COLORED_ICP = bool(params.get("use_colored_icp", False))
     MAX_ICP_Z_ROTATION_DEG = float(params["max_yaw_deg"])
     ICP_DISTANCE_THRESHOLD = float(params["icp_threshold_m"])
     ICP_VOXEL_SIZE = float(params["icp_voxel_m"])
@@ -828,6 +1154,7 @@ def apply_icp_merge_config(params: dict) -> None:
 
     print(
         f"[ICP CONFIG] Applied — icp={RUN_LIMITED_ICP} trans_only={ICP_ONLY_TRANSLATION} "
+        f"colored_icp={USE_COLORED_ICP} "
         f"yaw={MAX_ICP_Z_ROTATION_DEG:.1f}deg th={ICP_DISTANCE_THRESHOLD*1000:.1f}mm "
         f"vox={ICP_VOXEL_SIZE*1000:.1f}mm final_vox={VOXEL_SIZE_FINAL_PER_OBJECT*1000:.1f}mm "
         f"shift=({GLOBAL_FINAL_SHIFT_M[0]*1000:.1f},{GLOBAL_FINAL_SHIFT_M[1]*1000:.1f},"
@@ -912,7 +1239,32 @@ def merge_outputs(scans: list[ScanData], run_dir: Path) -> dict[str, Any]:
     ref_frame = build_marker_frame(ref_corners)
     floor_ref_local = world_to_local(corners_to_array(ref_corners), ref_frame)
     all_corner_only, all_icp = [], []
+    corner_metrics: list[dict] = []
+    icp_metrics: list[dict] = []
     debug = {"objects": []}
+
+    # --- save raw per-view per-object clouds ---
+    raw_dir = run_dir / "raw_views"
+    raw_dir.mkdir(exist_ok=True)
+    raw_view_all: dict[int, list[o3d.geometry.PointCloud]] = {}  # view_id -> list of per-object pcds
+    for scan in scans:
+        scan_frame = build_marker_frame(scan.corners_cam_m)
+        per_view: list[o3d.geometry.PointCloud] = []
+        for obj in scan.objects:
+            local_pts = world_to_local(obj.points_cam_m, scan_frame)
+            pcd = np_to_o3d_cloud(local_pts, obj.colors_bgr)
+            obj_path = raw_dir / f"object_{obj.object_id:02d}_view_{scan.view_id:02d}_raw.ply"
+            o3d.io.write_point_cloud(str(obj_path), pcd)
+            print(f"[SAVE] {obj_path}")
+            per_view.append(pcd)
+        all_raw = o3d.geometry.PointCloud()
+        for p in per_view:
+            all_raw += p
+        all_raw_path = raw_dir / f"all_objects_view_{scan.view_id:02d}_raw.ply"
+        o3d.io.write_point_cloud(str(all_raw_path), all_raw)
+        print(f"[SAVE] {all_raw_path}")
+        raw_view_all[scan.view_id] = per_view
+
     for object_id in range(TARGET_OBJECT_COUNT):
         print(f"\n[MERGE] object_{object_id:02d}")
         ref_obj, src_obj = ref_scan.objects[object_id], src_scan.objects[object_id]
@@ -929,6 +1281,14 @@ def merge_outputs(scans: list[ScanData], run_dir: Path) -> dict[str, Any]:
         o3d.io.write_point_cloud(str(corners_path), corners_merged)
         print(f"[SAVE] {corners_path}")
         all_corner_only.append(corners_merged)
+
+        if ENABLE_OBJECT_HEIGHT_METRICS:
+            corner_metrics.append(compute_object_height_metrics(np.asarray(corners_merged.points), object_id))
+
+        if KNOWN_GEOMETRY_VALIDATION and object_id == KNOWN_OBJECT_ID:
+            bbox_m = compute_cloud_bbox_metrics(corners_merged)
+            debug.setdefault("known_geometry_corners", {})[object_id] = bbox_m
+
         src_pcd_icp, icp_info = run_limited_icp(src_pcd_corner, ref_pcd)
         icp_merged = o3d.geometry.PointCloud(); icp_merged += ref_pcd; icp_merged += src_pcd_icp
         icp_merged = downsample_pcd(remove_outliers_pcd(icp_merged, FINAL_OUTLIER_NB_NEIGHBORS, FINAL_OUTLIER_STD_RATIO), VOXEL_SIZE_FINAL_PER_OBJECT)
@@ -936,20 +1296,43 @@ def merge_outputs(scans: list[ScanData], run_dir: Path) -> dict[str, Any]:
         o3d.io.write_point_cloud(str(icp_path), icp_merged)
         print(f"[SAVE] {icp_path}")
         all_icp.append(icp_merged)
+
+        if ENABLE_OBJECT_HEIGHT_METRICS:
+            icp_metrics.append(compute_object_height_metrics(np.asarray(icp_merged.points), object_id))
+
         debug["objects"].append({"object_id": object_id, "warp": warp_info, "icp": icp_info})
+
     all_corners = o3d.geometry.PointCloud()
     for p in all_corner_only: all_corners += p
     all_corners = downsample_pcd(remove_outliers_pcd(all_corners, FINAL_OUTLIER_NB_NEIGHBORS, FINAL_OUTLIER_STD_RATIO), VOXEL_SIZE_FINAL_ALL_OBJECTS)
     all_corners_path = run_dir / "all_objects_merged_corners_only.ply"
     o3d.io.write_point_cloud(str(all_corners_path), all_corners)
+
     all_icp_pcd = o3d.geometry.PointCloud()
     for p in all_icp: all_icp_pcd += p
     all_icp_pcd = downsample_pcd(remove_outliers_pcd(all_icp_pcd, FINAL_OUTLIER_NB_NEIGHBORS, FINAL_OUTLIER_STD_RATIO), VOXEL_SIZE_FINAL_ALL_OBJECTS)
     all_icp_path = run_dir / "all_objects_merged_limited_icp.ply"
     o3d.io.write_point_cloud(str(all_icp_path), all_icp_pcd)
+
     write_scene_with_floor_ply(run_dir / "workspace_plane_mesh.ply", floor_ref_local, [])
     write_scene_with_floor_ply(run_dir / "scene_corners_only_with_plane.ply", floor_ref_local, all_corner_only)
     write_scene_with_floor_ply(run_dir / "scene_limited_icp_with_plane.ply", floor_ref_local, all_icp)
+
+    if ENABLE_WORKSPACE_GRID_OUTPUT:
+        save_workspace_grid_and_axes_ply(run_dir, floor_ref_local)
+        write_scene_with_floor_ply(run_dir / "scene_corners_only_with_grid.ply", floor_ref_local, all_corner_only)
+        write_scene_with_floor_ply(run_dir / "scene_limited_icp_with_grid.ply", floor_ref_local, all_icp)
+
+    if ENABLE_OBJECT_HEIGHT_METRICS:
+        print_height_metrics_table("CORNERS ONLY", corner_metrics)
+        print_height_metrics_table("LIMITED ICP", icp_metrics)
+        save_height_metrics(run_dir, "object_height_metrics_corners_only", corner_metrics)
+        save_height_metrics(run_dir, "object_height_metrics_limited_icp", icp_metrics)
+        debug["height_metrics"] = {"corners_only": corner_metrics, "limited_icp": icp_metrics}
+
+    if ENABLE_PRESENTATION_MESH_OUTPUTS:
+        save_presentation_outputs(run_dir, "presentation_all_objects", all_icp_pcd)
+
     debug["outputs"] = {"corners_all": str(all_corners_path), "icp_all": str(all_icp_path)}
     return debug
 
@@ -1044,6 +1427,8 @@ def main() -> None:
     print("ONE-PASS TWO-VIEW SAM + ARUCO + RAFT + MERGE PIPELINE")
     print("=" * 72)
     print(f"[OUTPUT] {run_dir}")
+    print(f"[CONFIG] icp_merge_config={'best' if (USE_ICP_MERGE_CONFIG and PREFER_BEST_ICP_CONFIG and ICP_MERGE_CONFIG_BEST_PATH.exists()) else 'auto/default'}")
+    print(f"[CONFIG] workspace_grid={ENABLE_WORKSPACE_GRID_OUTPUT}  height_metrics={ENABLE_OBJECT_HEIGHT_METRICS}  presentation_mesh={ENABLE_PRESENTATION_MESH_OUTPUTS}  colored_icp={USE_COLORED_ICP}")
     print("\n[ORDER]")
     print("  1. Capture view 0 with all 4 markers")
     print("  2. Capture view 1 with all 4 markers")
